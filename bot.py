@@ -1,7 +1,7 @@
 """
 Telegram-бот «Планировщик задач».
 
-Запуск:  python bot.py   (или зелёная кнопка ▶ в PyCharm)
+Запуск:  python bot.py   (или кнопка ▶ в VS Code)
 Настройки (токен, часовой пояс) берутся из файла .env — см. README.md.
 """
 
@@ -678,7 +678,7 @@ def main():
     # Недельная сводка — по воскресеньям в 16:00 (в библиотеке 0 = воскресенье)
     app.job_queue.run_daily(weekly_summary, time=time(16, 0, tzinfo=TZ), days=(0,))
 
-    log.info("Бот запущен! Откройте его в Telegram и отправьте /start. Остановить: Ctrl+C или ■ в PyCharm.")
+    log.info("Бот запущен! Откройте его в Telegram и отправьте /start. Остановить: Control+C в этом окне.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
