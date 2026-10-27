@@ -1,0 +1,10 @@
+# Секреты и данные — не выкладываем в интернет
+.env
+tasks.db
+
+# Служебные файлы Python и PyCharm
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
