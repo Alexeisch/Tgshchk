@@ -1050,6 +1050,14 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         db.mark_reminded(task["id"], num)
 
 
+async def prepare_charts(context: ContextTypes.DEFAULT_TYPE):
+    """Готовим библиотеку диаграмм в фоне, чтобы бот не «замирал» при запуске."""
+    log.info("Готовлю диаграммы для отчётов. В первый раз это может занять 1–2 минуты — "
+             "бот при этом уже работает, ничего не нажимайте.")
+    await asyncio.to_thread(reports.prepare)
+    log.info("Диаграммы готовы.")
+
+
 async def check_reports(context: ContextTypes.DEFAULT_TYPE):
     """Каждую минуту: по воскресеньям — недельный отчёт, в последний день месяца — месячный."""
     n = now()
@@ -1114,6 +1122,7 @@ def main():
     app.job_queue.run_repeating(check_weather, interval=60, first=10)
     # Отчёты за неделю и месяц — тоже проверяем раз в минуту (время у каждого своё)
     app.job_queue.run_repeating(check_reports, interval=60, first=15)
+    app.job_queue.run_once(prepare_charts, when=1)
 
     log.info("Бот запущен! Откройте его в Telegram и отправьте /start. Остановить: Control+C в этом окне.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

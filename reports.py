@@ -11,9 +11,6 @@ import html
 from datetime import date, datetime, time, timedelta
 from io import BytesIO
 
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
-
 import database as db
 
 # Чёрно-серая палитра: выполнено / не выполнено / в процессе
@@ -108,8 +105,20 @@ def collect(user_id: int, period: dict, now: datetime) -> dict:
 
 # ---------- Картинка ----------
 
+def prepare():
+    """
+    Загружает библиотеку диаграмм заранее. При самом первом запуске она составляет список
+    шрифтов компьютера — на Mac это может занять 1–2 минуты, потом всё работает быстро.
+    """
+    import matplotlib.font_manager  # noqa: F401  (сама загрузка и строит список шрифтов)
+
+
 def render_chart(period: dict, stats: dict) -> bytes:
     """Рисует картинку: кольцевая диаграмма слева и столбики по дням/неделям справа."""
+    # Импорт здесь, а не в начале файла, чтобы бот запускался сразу, не дожидаясь библиотеки
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
     fig = Figure(figsize=(9, 4.6), dpi=150, facecolor="white")
     FigureCanvasAgg(fig)
     fig.text(0.04, 0.93, period["title"].upper(), fontsize=17, fontweight="bold", color="#111111")
