@@ -5,6 +5,7 @@ Telegram-бот «Планировщик задач».
 Настройки (токен, часовой пояс) берутся из файла .env — см. README.md.
 """
 
+import asyncio
 import html
 import logging
 import os
@@ -25,6 +26,7 @@ from telegram.ext import (
 )
 
 import database as db
+import reports
 import weather
 from date_parser import (REPEAT_KINDS, first_occurrence, make_repeat, next_date, next_occurrence,
                          parse_task, parse_when, repeat_label)
@@ -52,6 +54,7 @@ WAIT_RESCHEDULE = "wait_reschedule"
 WAIT_EDIT_TEXT = "wait_edit_text"
 WAIT_CITY = "wait_city"
 WAIT_WEATHER_TIME = "wait_weather_time"
+WAIT_REPORT_TIME = "wait_report_time"
 
 
 def now() -> datetime:
@@ -560,7 +563,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     # Сюда будут добавляться новые разделы настроек
     await reply_or_edit(update, header("Настройки") + "\n\nВыберите раздел.", kb([
-        [("Погода", "w_settings")],
+        [("Погода", "w_settings"), ("Отчёты", "r_settings")],
         [("⌂  Главное меню", "menu")],
     ]))
 
@@ -677,6 +680,118 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_weather_now(update, context)
 
 
+# ---------- Настройки: отчёты ----------
+
+REPORT_TIMES = ["09:00", "12:00", "16:00", "18:00", "20:00", "21:00"]
+REPORT_NAMES = {"week": "Еженедельный", "month": "Ежемесячный"}
+REPORT_DAYS = {"week": "по воскресеньям", "month": "в последний день месяца"}
+
+
+def is_report_day(kind: str, d: date) -> bool:
+    return d.weekday() == 6 if kind == "week" else reports.is_last_day_of_month(d)
+
+
+def mark_report_sent_if_time_passed(user_id: int, kind: str, r_time: str):
+    """Если сегодня день отчёта, а выбранное время уже прошло, — сегодня отчёт не шлём."""
+    n = now()
+    passed = is_report_day(kind, n.date()) and r_time <= n.strftime("%H:%M")
+    db.update_user(user_id, **{f"report_{kind}_last_sent": n.date().isoformat() if passed else None})
+
+
+async def show_report_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, note: str = ""):
+    context.user_data.clear()
+    user = db.get_user(update.effective_user.id)
+    lines = [header("Отчёты", "Настройки"), ""]
+    if note:
+        lines += [note, ""]
+    rows_text, rows = [], []
+    for kind in ("week", "month"):
+        enabled = user[f"report_{kind}_enabled"]
+        r_time = user[f"report_{kind}_time"]
+        status = f"{REPORT_DAYS[kind]} в {r_time}" if enabled else "выключен"
+        rows_text.append(f"{REPORT_NAMES[kind]} — {status}")
+        rows.append([(f"Время: {'неделя' if kind == 'week' else 'месяц'}", f"r_time:{kind}"),
+                     ("○  Выключить" if enabled else "●  Включить", f"r_toggle:{kind}")])
+    lines.append("<blockquote>" + "\n".join(rows_text) + "</blockquote>")
+    lines.append("В отчёте — диаграмма и проценты: сколько задач выполнено, не выполнено и в процессе.")
+    rows.append([("Отчёт за неделю", "r_now:week"), ("Отчёт за месяц", "r_now:month")])
+    rows.append([("←  Настройки", "settings"), ("⌂  Меню", "menu")])
+    await reply_or_edit(update, "\n".join(lines), kb(rows))
+
+
+async def ask_report_time(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+    context.user_data.clear()
+    context.user_data["state"] = WAIT_REPORT_TIME
+    context.user_data["report_kind"] = kind
+    buttons = [(t, f"r_settime:{kind}:{t}") for t in REPORT_TIMES]
+    await reply_or_edit(
+        update,
+        header(f"{REPORT_NAMES[kind]} отчёт", f"Приходит {REPORT_DAYS[kind]}") + "\n\n"
+        "Выберите время или напишите своё, например <code>17:30</code>.",
+        kb([buttons[:3], buttons[3:], [("←  Назад", "r_settings")]]),
+    )
+
+
+async def set_report_time(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, r_time: str):
+    uid = update.effective_user.id
+    db.update_user(uid, **{f"report_{kind}_time": r_time, f"report_{kind}_enabled": 1})
+    mark_report_sent_if_time_passed(uid, kind, r_time)
+    await show_report_settings(update, context,
+                               f"<i>{REPORT_NAMES[kind]} отчёт будет приходить {REPORT_DAYS[kind]} в {r_time}.</i>")
+
+
+async def toggle_report(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    if user[f"report_{kind}_enabled"]:
+        db.update_user(uid, **{f"report_{kind}_enabled": 0})
+        note = f"<i>{REPORT_NAMES[kind]} отчёт выключен.</i>"
+    else:
+        db.update_user(uid, **{f"report_{kind}_enabled": 1})
+        mark_report_sent_if_time_passed(uid, kind, user[f"report_{kind}_time"])
+        note = f"<i>{REPORT_NAMES[kind]} отчёт включён.</i>"
+    await show_report_settings(update, context, note)
+
+
+async def send_report(bot, user_id: int, kind: str):
+    """Готовит и отправляет отчёт: картинку с подписью (или только текст, если задач не было)."""
+    n = now()
+    period = reports.week_period(n.date()) if kind == "week" else reports.month_period(n.date())
+    # Рисование картинки занимает около секунды — делаем это в фоне, чтобы бот не «замирал»
+    text, image = await asyncio.to_thread(reports.build, user_id, period, n)
+    markup = kb([[("≡  Текущие задачи", "list:all"), ("⌂  Меню", "menu")]])
+    if image:
+        await bot.send_photo(user_id, photo=image, caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    else:
+        await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
+    await send_report(context.bot, update.effective_user.id, kind)
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /summary — отчёт за текущую неделю прямо сейчас."""
+    if allowed(update):
+        db.save_user(update.effective_user.id, update.effective_user.first_name or "")
+        await report_now(update, context, "week")
+
+
+async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /month — отчёт за текущий месяц прямо сейчас."""
+    if allowed(update):
+        db.save_user(update.effective_user.id, update.effective_user.first_name or "")
+        await report_now(update, context, "month")
+
+
+def parse_hhmm(text: str):
+    """"7:30", "07.30", "17:00" -> "07:30" / "17:00"; если не время — None."""
+    try:
+        return time.fromisoformat(text.strip().replace(".", ":").zfill(5)).strftime("%H:%M")
+    except ValueError:
+        return None
+
+
 # ---------- Обработка нажатий на кнопки ----------
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -715,6 +830,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_weather(update, context)
     elif action == "w_now":
         await send_weather_now(update, context)
+    elif action == "r_settings":
+        await show_report_settings(update, context)
+    elif action == "r_time":
+        await ask_report_time(update, context, arg)
+    elif action == "r_settime":
+        kind, r_time = arg.split(":", 1)
+        await set_report_time(update, context, kind, r_time)
+    elif action == "r_toggle":
+        await toggle_report(update, context, arg)
+    elif action == "r_now":
+        await report_now(update, context, arg)
     elif action == "new":
         await ask_new_task(update, context)
     elif action == "list":
@@ -820,13 +946,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Уточните город:", reply_markup=kb(rows))
         return
 
-    if state == WAIT_WEATHER_TIME:
-        try:
-            t = time.fromisoformat(text.replace(".", ":").zfill(5))
-        except ValueError:
-            await update.message.reply_text("Не удалось распознать время. Пример: 7:30 или 08:00.")
+    if state in (WAIT_WEATHER_TIME, WAIT_REPORT_TIME):
+        hhmm = parse_hhmm(text)
+        if not hhmm:
+            await update.message.reply_text("Не удалось распознать время. Пример: 7:30 или 18:00.")
             return
-        await set_weather_time(update, context, t.strftime("%H:%M"))
+        if state == WAIT_WEATHER_TIME:
+            await set_weather_time(update, context, hhmm)
+        else:
+            await set_report_time(update, context, context.user_data["report_kind"], hhmm)
         return
 
     if state == WAIT_DRAFT_WHEN:
@@ -922,60 +1050,19 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         db.mark_reminded(task["id"], num)
 
 
-def build_summary(user_id: int, today: date) -> str:
-    week_start = today - timedelta(days=today.weekday())  # понедельник
-    week_end = week_start + timedelta(days=6)              # воскресенье
-    planned = db.tasks_for_period(user_id, week_start, week_end)
-    done = [t for t in planned if t["status"] == "done"]
-    not_done = [t for t in planned if t["status"] != "done"]
-    extra_done = db.done_without_date(user_id, week_start, week_end)
-
-    period = f"{week_start.strftime('%d.%m')} – {week_end.strftime('%d.%m')}"
-    if not planned and not extra_done:
-        return header("Итоги недели", period) + "\n\nНа этой неделе задач не было."
-
-    lines = [header("Итоги недели", period), ""]
-    if planned:
-        pct_done = round(len(done) * 100 / len(planned))
-        filled = round(pct_done / 10)
-        # Моноширинный блок: столбцы ровные, полоса — из чёрно-белых квадратов
-        lines.append(
-            "<pre>"
-            f"{'■' * filled}{'□' * (10 - filled)}  {pct_done}%\n\n"
-            f"{'Запланировано':<15}{len(planned):>4}\n"
-            f"{'Выполнено':<15}{len(done):>4}\n"
-            f"{'Не выполнено':<15}{len(not_done):>4}"
-            "</pre>"
-        )
-    if extra_done:
-        lines.append(f"Также выполнено задач без срока: {len(extra_done)}")
-    if not_done:
-        lines.append("\n<b>Не выполнены</b>")
-        lines.append("<blockquote>" + "\n".join(html.escape(short_label(t)) for t in not_done[:15])
-                     + "</blockquote>")
-    return "\n".join(lines)
-
-
-async def weekly_summary(context: ContextTypes.DEFAULT_TYPE):
-    """Каждое воскресенье в 16:00 отправляет сводку всем пользователям."""
-    today = now().date()
-    for user in db.all_users():
-        try:
-            await context.bot.send_message(
-                user["user_id"], build_summary(user["user_id"], today),
-                reply_markup=kb([[("≡  Текущие задачи", "list:all")]]),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as exc:
-            log.warning("Не удалось отправить сводку %s: %s", user["user_id"], exc)
-
-
-async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /summary — посмотреть сводку за текущую неделю прямо сейчас."""
-    if not allowed(update):
-        return
-    await update.message.reply_text(build_summary(update.effective_user.id, now().date()),
-                                    reply_markup=BACK_TO_MENU, parse_mode=ParseMode.HTML)
+async def check_reports(context: ContextTypes.DEFAULT_TYPE):
+    """Каждую минуту: по воскресеньям — недельный отчёт, в последний день месяца — месячный."""
+    n = now()
+    today = n.date().isoformat()
+    for kind in ("week", "month"):
+        if not is_report_day(kind, n.date()):
+            continue
+        for user in db.users_for_report(kind, n.strftime("%H:%M"), today):
+            try:
+                await send_report(context.bot, user["user_id"], kind)
+            except Exception as exc:
+                log.warning("Не удалось отправить отчёт %s: %s", user["user_id"], exc)
+            db.update_user(user["user_id"], **{f"report_{kind}_last_sent": today})
 
 
 async def check_weather(context: ContextTypes.DEFAULT_TYPE):
@@ -1016,6 +1103,7 @@ def main():
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("weather", weather_command))
+    app.add_handler(CommandHandler("month", month_command))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
@@ -1024,8 +1112,8 @@ def main():
     app.job_queue.run_repeating(check_reminders, interval=60, first=5)
     # Ежедневный прогноз погоды — тоже проверяем раз в минуту
     app.job_queue.run_repeating(check_weather, interval=60, first=10)
-    # Недельная сводка — по воскресеньям в 16:00 (в библиотеке 0 = воскресенье)
-    app.job_queue.run_daily(weekly_summary, time=time(16, 0, tzinfo=TZ), days=(0,))
+    # Отчёты за неделю и месяц — тоже проверяем раз в минуту (время у каждого своё)
+    app.job_queue.run_repeating(check_reports, interval=60, first=15)
 
     log.info("Бот запущен! Откройте его в Telegram и отправьте /start. Остановить: Control+C в этом окне.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

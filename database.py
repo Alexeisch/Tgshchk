@@ -69,6 +69,13 @@ USER_SETTINGS_COLUMNS = {
     "weather_time": "TEXT DEFAULT '08:00'",    # во сколько присылать прогноз
     "weather_enabled": "INTEGER DEFAULT 0",    # 1 — присылать каждый день
     "weather_last_sent": "TEXT",               # дата последней отправки
+    # Отчёты: еженедельный (по воскресеньям) и ежемесячный (в последний день месяца)
+    "report_week_enabled": "INTEGER DEFAULT 1",
+    "report_week_time": "TEXT DEFAULT '16:00'",
+    "report_week_last_sent": "TEXT",
+    "report_month_enabled": "INTEGER DEFAULT 1",
+    "report_month_time": "TEXT DEFAULT '20:00'",
+    "report_month_last_sent": "TEXT",
 }
 
 
@@ -114,6 +121,20 @@ def update_user(user_id: int, **fields):
     sets = ", ".join(f"{name} = ?" for name in fields)
     with connect() as conn:
         conn.execute(f"UPDATE users SET {sets} WHERE user_id = ?", (*fields.values(), user_id))
+
+
+def users_for_report(kind: str, hhmm: str, today: str):
+    """Пользователи, которым пора отправить отчёт kind ("week" или "month")."""
+    assert kind in ("week", "month")
+    with connect() as conn:
+        return conn.execute(
+            f"""
+            SELECT * FROM users
+            WHERE report_{kind}_enabled = 1 AND report_{kind}_time <= ?
+              AND (report_{kind}_last_sent IS NULL OR report_{kind}_last_sent < ?)
+            """,
+            (hhmm, today),
+        ).fetchall()
 
 
 def users_for_weather(hhmm: str, today: str):
