@@ -25,6 +25,7 @@ from telegram.ext import (
 )
 
 import database as db
+import weather
 from date_parser import parse_task, parse_when
 
 # ---------- Настройки ----------
@@ -48,6 +49,8 @@ WAIT_NEW_TASK = "wait_new_task"
 WAIT_DRAFT_WHEN = "wait_draft_when"
 WAIT_RESCHEDULE = "wait_reschedule"
 WAIT_EDIT_TEXT = "wait_edit_text"
+WAIT_CITY = "wait_city"
+WAIT_WEATHER_TIME = "wait_weather_time"
 
 
 def now() -> datetime:
@@ -140,6 +143,7 @@ MAIN_MENU = kb([
     [("➕ Создать новую задачу", "new")],
     [("📋 Текущие задачи", "list:all")],
     [("✅ Выполненные задачи", "done_list")],
+    [("⚙️ Настройки", "settings")],
 ])
 
 BACK_TO_MENU = kb([[("🏠 Главное меню", "menu")]])
@@ -423,6 +427,129 @@ async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
                         kb([[("Да, удалить", f"delyes:{task_id}"), ("Нет", f"task:{task_id}")]]))
 
 
+# ---------- Настройки ----------
+
+WEATHER_TIMES = ["06:00", "07:00", "07:30", "08:00", "09:00", "10:00"]
+
+
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    # Сюда будут добавляться новые разделы настроек
+    await reply_or_edit(update, "⚙️ <b>Настройки</b>\n\nВыберите раздел:", kb([
+        [("🌤 Погода", "w_settings")],
+        [("🏠 Главное меню", "menu")],
+    ]))
+
+
+async def show_weather_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, note: str = ""):
+    context.user_data.clear()
+    user = db.get_user(update.effective_user.id)
+    city = user["city_name"] if user else None
+    w_time = (user["weather_time"] if user else None) or "08:00"
+    enabled = bool(user and user["weather_enabled"])
+
+    lines = ["🌤 <b>Настройки погоды</b>", ""]
+    if note:
+        lines += [note, ""]
+    lines.append(f"🏙 Город: <b>{html.escape(city)}</b>" if city else "🏙 Город: не выбран")
+    lines.append(f"🕐 Время прогноза: <b>{w_time}</b>")
+    lines.append("🔔 Ежедневный прогноз: <b>включён</b>" if enabled else "🔕 Ежедневный прогноз: выключен")
+    if not city:
+        lines += ["", "Чтобы получать прогноз, сначала укажите свой город."]
+
+    rows = [[("🏙 Изменить город" if city else "🏙 Указать город", "w_city")]]
+    if city:
+        rows.append([("🕐 Время прогноза", "w_time"),
+                     ("🔕 Выключить" if enabled else "🔔 Включить", "w_toggle")])
+        rows.append([("👀 Погода сейчас", "w_now")])
+    rows.append([("⬅️ Настройки", "settings"), ("🏠 Меню", "menu")])
+    await reply_or_edit(update, "\n".join(lines), kb(rows))
+
+
+async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data["state"] = WAIT_CITY
+    await reply_or_edit(update, "🏙 <b>Напишите название вашего города.</b>\n\nНапример: <code>Москва</code>",
+                        kb([[("⬅️ Назад", "w_settings")]]))
+
+
+def mark_weather_sent_if_time_passed(user_id: int, w_time: str):
+    """Если выбранное время сегодня уже прошло — сегодняшний прогноз не шлём, начнём с завтра."""
+    n = now()
+    if w_time <= n.strftime("%H:%M"):
+        db.update_user(user_id, weather_last_sent=n.date().isoformat())
+    else:
+        db.update_user(user_id, weather_last_sent=None)
+
+
+async def save_city(update: Update, context: ContextTypes.DEFAULT_TYPE, city: dict):
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    first_time = not user["city_name"]
+    db.update_user(uid, city_name=city["name"], city_lat=city["lat"], city_lon=city["lon"])
+    note = f"✅ Город сохранён: <b>{html.escape(city['label'])}</b>"
+    if first_time:
+        # При первом выборе города сразу включаем ежедневный прогноз
+        w_time = user["weather_time"] or "08:00"
+        db.update_user(uid, weather_enabled=1, weather_time=w_time)
+        mark_weather_sent_if_time_passed(uid, w_time)
+        note += f"\nПрогноз будет приходить каждый день в {w_time}. Время можно поменять ниже."
+    await show_weather_settings(update, context, note)
+
+
+async def ask_weather_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.user_data["state"] = WAIT_WEATHER_TIME
+    buttons = [(t, f"w_settime:{t}") for t in WEATHER_TIMES]
+    await reply_or_edit(
+        update,
+        "🕐 <b>Во сколько присылать прогноз?</b>\n\n"
+        "Нажмите кнопку или напишите своё время, например <code>6:45</code>.",
+        kb([buttons[:3], buttons[3:], [("⬅️ Назад", "w_settings")]]),
+    )
+
+
+async def set_weather_time(update: Update, context: ContextTypes.DEFAULT_TYPE, w_time: str):
+    uid = update.effective_user.id
+    db.update_user(uid, weather_time=w_time, weather_enabled=1)
+    mark_weather_sent_if_time_passed(uid, w_time)
+    await show_weather_settings(update, context, f"✅ Прогноз будет приходить каждый день в {w_time}.")
+
+
+async def toggle_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    if user["weather_enabled"]:
+        db.update_user(uid, weather_enabled=0)
+        note = "🔕 Ежедневный прогноз выключен."
+    else:
+        db.update_user(uid, weather_enabled=1)
+        mark_weather_sent_if_time_passed(uid, user["weather_time"] or "08:00")
+        note = "🔔 Ежедневный прогноз включён."
+    await show_weather_settings(update, context, note)
+
+
+async def send_weather_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user or not user["city_name"]:
+        await show_weather_settings(update, context, "Сначала укажите город.")
+        return
+    try:
+        text = await weather.today_text(user["city_name"], user["city_lat"], user["city_lon"])
+    except weather.WeatherError as exc:
+        log.warning("Погода недоступна: %s", exc)
+        text = "😔 Не удалось получить прогноз. Попробуйте чуть позже."
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=BACK_TO_MENU)
+
+
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /weather — погода на сегодня прямо сейчас."""
+    if not allowed(update):
+        return
+    db.save_user(update.effective_user.id, update.effective_user.first_name or "")
+    await send_weather_now(update, context)
+
+
 # ---------- Обработка нажатий на кнопки ----------
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -430,6 +557,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await answer_query(update, "Это личный бот 🙂")
         return
+    db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     data = query.data
     action, _, arg = data.partition(":")
 
@@ -440,6 +568,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "menu":
         await show_menu(update, context)
+    elif action == "settings":
+        await show_settings(update, context)
+    elif action == "w_settings":
+        await show_weather_settings(update, context)
+    elif action == "w_city":
+        await ask_city(update, context)
+    elif action == "w_citypick":
+        cities = context.user_data.get("cities") or []
+        if int(arg) < len(cities):
+            await save_city(update, context, cities[int(arg)])
+        else:
+            await ask_city(update, context)
+    elif action == "w_time":
+        await ask_weather_time(update, context)
+    elif action == "w_settime":
+        await set_weather_time(update, context, arg)
+    elif action == "w_toggle":
+        await toggle_weather(update, context)
+    elif action == "w_now":
+        await send_weather_now(update, context)
     elif action == "new":
         await ask_new_task(update, context)
     elif action == "list":
@@ -509,6 +657,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state")
     uid = update.effective_user.id
     n = now()
+
+    if state == WAIT_CITY:
+        try:
+            cities = await weather.find_cities(text)
+        except weather.WeatherError as exc:
+            log.warning("Поиск города не удался: %s", exc)
+            await update.message.reply_text("😔 Сервис погоды сейчас недоступен. Попробуйте чуть позже.")
+            return
+        if not cities:
+            await update.message.reply_text(
+                "🤔 Не нашёл такой город. Проверьте написание и отправьте ещё раз.")
+            return
+        if len(cities) == 1:
+            await save_city(update, context, cities[0])
+            return
+        # Несколько городов с таким названием — даём выбрать
+        context.user_data["cities"] = cities
+        rows = [[(c["label"][:60], f"w_citypick:{i}")] for i, c in enumerate(cities)]
+        rows.append([("⬅️ Назад", "w_settings")])
+        await update.message.reply_text("Какой из городов ваш?", reply_markup=kb(rows))
+        return
+
+    if state == WAIT_WEATHER_TIME:
+        try:
+            t = time.fromisoformat(text.replace(".", ":").zfill(5))
+        except ValueError:
+            await update.message.reply_text("🤔 Не понял время. Напишите, например, 7:30 или 08:00.")
+            return
+        await set_weather_time(update, context, t.strftime("%H:%M"))
+        return
 
     if state == WAIT_DRAFT_WHEN:
         d_new, t_new = parse_when(text, n)
@@ -659,6 +837,23 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     reply_markup=BACK_TO_MENU, parse_mode=ParseMode.HTML)
 
 
+async def check_weather(context: ContextTypes.DEFAULT_TYPE):
+    """Запускается каждую минуту и отправляет ежедневный прогноз тем, у кого наступило время."""
+    n = now()
+    today = n.date().isoformat()
+    for user in db.users_for_weather(n.strftime("%H:%M"), today):
+        try:
+            text = await weather.today_text(user["city_name"], user["city_lat"], user["city_lon"])
+        except weather.WeatherError as exc:
+            log.warning("Погода недоступна, повторю через минуту: %s", exc)
+            return
+        try:
+            await context.bot.send_message(user["user_id"], text, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            log.warning("Не удалось отправить погоду %s: %s", user["user_id"], exc)
+        db.update_user(user["user_id"], weather_last_sent=today)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Ошибка при обработке сообщения", exc_info=context.error)
 
@@ -679,12 +874,15 @@ def main():
 
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("summary", summary_command))
+    app.add_handler(CommandHandler("weather", weather_command))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
 
     # Проверка напоминаний — раз в минуту
     app.job_queue.run_repeating(check_reminders, interval=60, first=5)
+    # Ежедневный прогноз погоды — тоже проверяем раз в минуту
+    app.job_queue.run_repeating(check_weather, interval=60, first=10)
     # Недельная сводка — по воскресеньям в 16:00 (в библиотеке 0 = воскресенье)
     app.job_queue.run_daily(weekly_summary, time=time(16, 0, tzinfo=TZ), days=(0,))
 

@@ -55,6 +55,27 @@ def init_db():
             )
             """
         )
+        # Новые поля добавляем отдельно, чтобы у тех, кто уже пользуется ботом,
+        # база обновилась автоматически и задачи не пропали.
+        _add_missing_columns(conn, "users", USER_SETTINGS_COLUMNS)
+
+
+# Настройки пользователя (хранятся в таблице users)
+USER_SETTINGS_COLUMNS = {
+    "city_name": "TEXT",                       # город для погоды
+    "city_lat": "REAL",
+    "city_lon": "REAL",
+    "weather_time": "TEXT DEFAULT '08:00'",    # во сколько присылать прогноз
+    "weather_enabled": "INTEGER DEFAULT 0",    # 1 — присылать каждый день
+    "weather_last_sent": "TEXT",               # дата последней отправки
+}
+
+
+def _add_missing_columns(conn, table: str, columns: dict):
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, sql_type in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 # ---------- Пользователи ----------
@@ -71,6 +92,34 @@ def save_user(user_id: int, first_name: str):
 def all_users():
     with connect() as conn:
         return conn.execute("SELECT * FROM users").fetchall()
+
+
+def get_user(user_id: int):
+    with connect() as conn:
+        return conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+
+
+def update_user(user_id: int, **fields):
+    """Меняет настройки пользователя, например: update_user(1, city_name="Москва")."""
+    for name in fields:
+        if name not in USER_SETTINGS_COLUMNS:
+            raise ValueError(f"Неизвестная настройка: {name}")
+    sets = ", ".join(f"{name} = ?" for name in fields)
+    with connect() as conn:
+        conn.execute(f"UPDATE users SET {sets} WHERE user_id = ?", (*fields.values(), user_id))
+
+
+def users_for_weather(hhmm: str, today: str):
+    """Пользователи, которым пора отправить прогноз: время совпало, сегодня ещё не отправляли."""
+    with connect() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM users
+            WHERE weather_enabled = 1 AND city_lat IS NOT NULL
+              AND weather_time <= ? AND (weather_last_sent IS NULL OR weather_last_sent < ?)
+            """,
+            (hhmm, today),
+        ).fetchall()
 
 
 # ---------- Напоминания ----------
