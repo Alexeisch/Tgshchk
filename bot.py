@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -194,6 +195,15 @@ async def reply_or_edit(update: Update, text: str, markup=None):
         except Exception:
             pass  # например, сообщение слишком старое — тогда просто отправим новое
     await update.effective_chat.send_message(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+
+async def answer_query(update: Update, text: str = None):
+    """Отвечает на нажатие кнопки. Если нажатие старое (бот был выключен), Telegram
+    его уже не принимает — просто пропускаем, чтобы не было ошибки в терминале."""
+    try:
+        await update.callback_query.answer(text)
+    except BadRequest:
+        pass
 
 
 # ---------- Главное меню ----------
@@ -397,7 +407,7 @@ async def ask_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: 
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
     uid = update.effective_user.id
     db.set_done(task_id, uid, now())
-    await update.callback_query.answer("Отлично! Задача выполнена ✅")
+    await answer_query(update, "Отлично! Задача выполнена ✅")
     task = db.get_task(task_id, uid)
     if task:
         await reply_or_edit(update, "🎉 <b>Задача выполнена!</b>\n\n" + card_from_row(task),
@@ -418,15 +428,15 @@ async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not allowed(update):
-        await query.answer("Это личный бот 🙂")
+        await answer_query(update, "Это личный бот 🙂")
         return
     data = query.data
     action, _, arg = data.partition(":")
 
     if action == "done":
         await mark_done(update, context, int(arg))
-        return  # mark_done сам вызывает query.answer
-    await query.answer()
+        return  # mark_done сам отвечает на нажатие
+    await answer_query(update)
 
     if action == "menu":
         await show_menu(update, context)
