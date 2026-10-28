@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -257,12 +257,27 @@ async def answer_query(update: Update, text: str = None):
 
 # ---------- Главное меню ----------
 
+# Кнопки меню внизу экрана из пробной версии интерфейса (её откатили). Telegram помнит такое
+# меню, поэтому если на них нажмут — убираем меню и показываем обычное главное меню.
+OLD_BOTTOM_MENU = {"◉ Сегодня", "≡ Задачи", "+ Задача", "▤ Вкладки", "◔ Отчёты", "⋯ Настройки"}
+
+
+async def remove_bottom_menu(update: Update):
+    """Убирает меню внизу экрана: отправляем служебное сообщение с командой «убрать» и сразу удаляем его."""
+    try:
+        message = await update.effective_chat.send_message("…", reply_markup=ReplyKeyboardRemove())
+        await message.delete()
+    except Exception:
+        pass
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         await update.message.reply_text("Доступ к этому боту ограничен.")
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     context.user_data.clear()
+    await remove_bottom_menu(update)
     await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
@@ -1144,6 +1159,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     n = now()
 
+    if text in OLD_BOTTOM_MENU:
+        await remove_bottom_menu(update)
+        await show_menu(update, context)
+        return
+
     if state == WAIT_CITY:
         try:
             cities = await weather.find_cities(text)
@@ -1329,6 +1349,16 @@ async def check_weather(context: ContextTypes.DEFAULT_TYPE):
         db.update_user(user["user_id"], weather_last_sent=today)
 
 
+async def set_commands(app: Application):
+    """Список команд для кнопки «Меню» слева от поля ввода в Telegram."""
+    await app.bot.set_my_commands([
+        BotCommand("start", "Главное меню"),
+        BotCommand("summary", "Отчёт за неделю"),
+        BotCommand("month", "Отчёт за месяц"),
+        BotCommand("weather", "Погода на сегодня"),
+    ])
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Ошибка при обработке сообщения", exc_info=context.error)
 
@@ -1345,7 +1375,7 @@ def main():
         )
 
     db.init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
 
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("summary", summary_command))
