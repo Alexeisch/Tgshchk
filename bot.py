@@ -643,6 +643,7 @@ async def show_tab_options(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         return
     n = db.count_active_by_category(uid).get(cat, 0)
     await reply_or_edit(update, header(tab["name"], "Вкладка") + f"\n\nТекущих задач: {n}", kb([
+        [("Отчёт: неделя", f"r_now:week:{cat}"), ("Отчёт: месяц", f"r_now:month:{cat}")],
         [("✎  Переименовать", f"tabren:{cat}"), ("✕  Удалить", f"tabdel:{cat}")],
         [("←  Назад", f"list:all:{cat}")],
     ]))
@@ -871,8 +872,10 @@ async def show_report_settings(update: Update, context: ContextTypes.DEFAULT_TYP
         rows.append([(f"Время: {'неделя' if kind == 'week' else 'месяц'}", f"r_time:{kind}"),
                      ("○  Выключить" if enabled else "●  Включить", f"r_toggle:{kind}")])
     lines.append("<blockquote>" + "\n".join(rows_text) + "</blockquote>")
-    lines.append("В отчёте — диаграмма и проценты: сколько задач выполнено, не выполнено и в процессе.")
+    lines.append("В отчёте — диаграмма и проценты: сколько задач выполнено, не выполнено и в процессе, "
+                 "и разбивка по вкладкам.")
     rows.append([("Отчёт за неделю", "r_now:week"), ("Отчёт за месяц", "r_now:month")])
+    rows.append([("▤  Отчёт по вкладке", "r_tabs")])
     rows.append([("←  Настройки", "settings"), ("⌂  Меню", "menu")])
     await reply_or_edit(update, "\n".join(lines), kb(rows))
 
@@ -911,21 +914,43 @@ async def toggle_report(update: Update, context: ContextTypes.DEFAULT_TYPE, kind
     await show_report_settings(update, context, note)
 
 
-async def send_report(bot, user_id: int, kind: str):
-    """Готовит и отправляет отчёт: картинку с подписью (или только текст, если задач не было)."""
+async def send_report(bot, user_id: int, kind: str, category_id: int = None):
+    """
+    Готовит и отправляет отчёт: картинку с подписью (или только текст, если задач не было).
+    category_id — отчёт только по одной вкладке.
+    """
     n = now()
     period = reports.week_period(n.date()) if kind == "week" else reports.month_period(n.date())
     # Рисование картинки занимает около секунды — делаем это в фоне, чтобы бот не «замирал»
-    text, image = await asyncio.to_thread(reports.build, user_id, period, n)
-    markup = kb([[("≡  Текущие задачи", "list:all"), ("⌂  Меню", "menu")]])
+    text, image = await asyncio.to_thread(reports.build, user_id, period, n, category_id)
+    markup = kb([[("≡  К задачам", f"list:all:{category_id or 0}"), ("⌂  Меню", "menu")]])
     if image:
         await bot.send_photo(user_id, photo=image, caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
     else:
         await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
-async def report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str):
-    await send_report(context.bot, update.effective_user.id, kind)
+async def report_now(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str, category_id: int = None):
+    uid = update.effective_user.id
+    if category_id is not None and not db.get_category(category_id, uid):
+        await show_menu(update, context)  # вкладку уже удалили
+        return
+    await send_report(context.bot, uid, kind, category_id)
+
+
+async def show_report_tab_picker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отчёт по вкладке: для каждой вкладки — кнопки «неделя» и «месяц»."""
+    tabs = db.get_categories(update.effective_user.id)
+    rows = []
+    for c in tabs:
+        name = c["name"] if len(c["name"]) <= 16 else c["name"][:15] + "…"
+        rows.append([(f"{name} · неделя", f"r_now:week:{c['id']}"),
+                     (f"{name} · месяц", f"r_now:month:{c['id']}")])
+    rows.append([("←  Назад", "r_settings")])
+    text = header("Отчёт по вкладке") + "\n\n"
+    text += ("Выберите вкладку и период — в отчёте будут только её задачи." if tabs else
+             "Вкладок пока нет — создайте их в главном меню кнопкой «Новая вкладка».")
+    await reply_or_edit(update, text, kb(rows))
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -998,7 +1023,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "r_toggle":
         await toggle_report(update, context, arg)
     elif action == "r_now":
-        await report_now(update, context, arg)
+        kind, _, cat = arg.partition(":")
+        await report_now(update, context, kind, int(cat) if cat else None)
+    elif action == "r_tabs":
+        await show_report_tab_picker(update, context)
     elif action == "new":
         await ask_new_task(update, context)
     elif action == "newin":

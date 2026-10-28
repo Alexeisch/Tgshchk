@@ -77,8 +77,13 @@ def _buckets(period: dict) -> list:
     return result
 
 
-def collect(user_id: int, period: dict, now: datetime) -> dict:
+def collect(user_id: int, period: dict, now: datetime, category_id: int = None) -> dict:
+    """Статистика за период. category_id — только задачи этой вкладки (None — все задачи)."""
     tasks = db.tasks_for_period(user_id, period["start"], period["end"])
+    extra = db.done_without_date(user_id, period["start"], period["end"])
+    if category_id is not None:
+        tasks = [t for t in tasks if t["category_id"] == category_id]
+        extra = [t for t in extra if t["category_id"] == category_id]
     counts = [0, 0, 0]
     missed = []
     buckets = [[label, 0, 0, 0] for label, _, _ in _buckets(period)]
@@ -99,8 +104,26 @@ def collect(user_id: int, period: dict, now: datetime) -> dict:
         "percents": [round(c * 100 / total) if total else 0 for c in counts],
         "missed": missed,
         "buckets": buckets,
-        "extra_done": len(db.done_without_date(user_id, period["start"], period["end"])),
+        "extra_done": len(extra),
+        "by_tab": _by_tab(user_id, tasks) if category_id is None else [],
     }
+
+
+def _by_tab(user_id: int, tasks) -> list:
+    """Разбивка по вкладкам: [(название, выполнено, всего), ...]. Пусто, если вкладок нет."""
+    tabs = db.get_categories(user_id)
+    if not tabs:
+        return []
+    names = {c["id"]: c["name"] for c in tabs}
+    stat = {}
+    for t in tasks:
+        key = t["category_id"] if t["category_id"] in names else None
+        done, total = stat.get(key, (0, 0))
+        stat[key] = (done + (t["status"] == "done"), total + 1)
+    rows = [(names[c["id"]], *stat[c["id"]]) for c in tabs if c["id"] in stat]
+    if None in stat:
+        rows.append(("Без вкладки", *stat[None]))
+    return rows
 
 
 # ---------- Картинка ----------
@@ -192,6 +215,12 @@ def caption(period: dict, stats: dict, prev_stats: dict) -> str:
         text += f"\nВыполнено {stats['percents'][0]}% — {sign}{diff} п.п. к {period['prev_name']}."
     if stats["extra_done"]:
         text += f"\nТакже выполнено задач без срока: {stats['extra_done']}."
+    if stats["by_tab"]:
+        rows = []
+        for name, done, total in stats["by_tab"]:
+            short = name if len(name) <= 13 else name[:12] + "…"
+            rows.append(f"{html.escape(short):<14}{done:>3}/{total:<3}{round(done * 100 / total):>4}%")
+        text += "\n\n<b>По вкладкам</b>\n<pre>" + "\n".join(rows) + "</pre>"
 
     if stats["missed"]:
         lines = []
@@ -210,10 +239,16 @@ def caption(period: dict, stats: dict, prev_stats: dict) -> str:
     return text
 
 
-def build(user_id: int, period: dict, now: datetime):
-    """Готовит отчёт. Возвращает (подпись, картинка или None, если задач не было)."""
-    stats = collect(user_id, period, now)
-    prev_stats = collect(user_id, previous_period(period), now)
+def build(user_id: int, period: dict, now: datetime, category_id: int = None):
+    """
+    Готовит отчёт. Возвращает (подпись, картинка или None, если задач не было).
+    category_id — отчёт только по одной вкладке.
+    """
+    if category_id is not None:
+        tab = db.get_category(category_id, user_id)
+        period = {**period, "subtitle": f"{tab['name']} · {period['subtitle']}"}
+    stats = collect(user_id, period, now, category_id)
+    prev_stats = collect(user_id, previous_period(period), now, category_id)
     text = caption(period, stats, prev_stats)
     image = render_chart(period, stats) if stats["total"] else None
     return text, image
