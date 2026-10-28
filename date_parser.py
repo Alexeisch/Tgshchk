@@ -210,15 +210,174 @@ def _clean_title(text: str) -> str:
     return text[:1].upper() + text[1:] if text else text
 
 
+# ---------- Повторяющиеся задачи ----------
+#
+# Правило повтора хранится строкой:
+#   "daily"          — каждый день
+#   "weekdays"       — по будням (пн–пт)
+#   "weekly:0"       — каждую неделю, по понедельникам (0 = пн ... 6 = вс)
+#   "monthly:5"      — каждый месяц, 5 числа
+#   "yearly:11-06"   — каждый год, 6 ноября
+
+REPEAT_KINDS = {
+    "daily": "Каждый день",
+    "weekdays": "По будням",
+    "weekly": "Каждую неделю",
+    "monthly": "Каждый месяц",
+    "yearly": "Каждый год",
+}
+
+WEEKDAY_EVERY = ["каждый понедельник", "каждый вторник", "каждую среду", "каждый четверг",
+                 "каждую пятницу", "каждую субботу", "каждое воскресенье"]
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def make_repeat(kind: str, start: date):
+    """Превращает вид повтора ("weekly") и дату первого раза в правило ("weekly:2")."""
+    if kind == "weekly":
+        return f"weekly:{start.weekday()}"
+    if kind == "monthly":
+        return f"monthly:{start.day}"
+    if kind == "yearly":
+        return f"yearly:{start.month:02d}-{start.day:02d}"
+    return kind if kind in ("daily", "weekdays") else None
+
+
+def repeat_label(repeat) -> str:
+    """Человекочитаемое описание правила: "каждую среду", "каждый месяц, 5 числа"."""
+    if not repeat:
+        return ""
+    kind, _, arg = repeat.partition(":")
+    if kind == "daily":
+        return "каждый день"
+    if kind == "weekdays":
+        return "по будням"
+    if kind == "weekly":
+        return WEEKDAY_EVERY[int(arg)]
+    if kind == "monthly":
+        return f"каждый месяц, {arg} числа"
+    if kind == "yearly":
+        month, day = (int(x) for x in arg.split("-"))
+        return f"каждый год, {day} {MONTHS_GEN[month - 1]}"
+    return ""
+
+
+def _month_day(year: int, month: int, day: int) -> date:
+    """Дата с поправкой на короткие месяцы: 31 число в феврале -> 28 (29)."""
+    while True:
+        d = _safe_date(year, month, day)
+        if d:
+            return d
+        day -= 1
+
+
+def next_date(repeat: str, after: date) -> date:
+    """Первая дата по правилу повтора строго после даты after."""
+    kind, _, arg = repeat.partition(":")
+    if kind == "daily":
+        return after + timedelta(days=1)
+    if kind == "weekdays":
+        d = after + timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+    if kind == "weekly":
+        return after + timedelta(days=(int(arg) - after.weekday() - 1) % 7 + 1)
+    if kind == "monthly":
+        d = _month_day(after.year, after.month, int(arg))
+        if d <= after:
+            y, m = _add_month(after)
+            d = _month_day(y, m, int(arg))
+        return d
+    if kind == "yearly":
+        month, day = (int(x) for x in arg.split("-"))
+        d = _month_day(after.year, month, day)
+        return d if d > after else _month_day(after.year + 1, month, day)
+    raise ValueError(f"Неизвестное правило повтора: {repeat}")
+
+
+def next_occurrence(repeat: str, due: date, today: date) -> date:
+    """Следующий раз после due, но не раньше сегодняшнего дня (если задачу закрыли с опозданием)."""
+    d = next_date(repeat, due)
+    while d < today:
+        d = next_date(repeat, d)
+    return d
+
+
+def first_occurrence(repeat: str, today: date) -> date:
+    """Ближайший подходящий день начиная с сегодняшнего."""
+    return next_date(repeat, today - timedelta(days=1))
+
+
+def extract_repeat(text: str, today: date):
+    """
+    Ищет слова о повторе: "каждый день", "по будням", "каждую среду", "каждое 5 число",
+    "ежемесячно" и т.п. Возвращает (вид повтора, подсказка даты или None, текст без фрагмента).
+    """
+    low = text.lower()
+    simple = [
+        (r"\b(?:каждый\s+день|ежедневно)\b", "daily"),
+        (r"\b(?:по\s+будням|каждый\s+будний\s+день|в\s+будни)\b", "weekdays"),
+        (r"\b(?:каждую\s+неделю|еженедельно)\b", "weekly"),
+        (r"\b(?:каждый\s+месяц|ежемесячно)\b", "monthly"),
+        (r"\b(?:каждый\s+год|ежегодно)\b", "yearly"),
+    ]
+    for pattern, kind in simple:
+        m = re.search(pattern, low)
+        if m:
+            return kind, None, _cut(text, m)
+
+    # "каждый понедельник", "каждую среду", "по пятницам"
+    m = re.search(r"\b(?:каждый|каждую|каждое)\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)\b", low)
+    if m:
+        target = WEEKDAYS[m.group(1)]
+        return "weekly", today + timedelta(days=(target - today.weekday()) % 7), _cut(text, m)
+    plural = {"понедельникам": 0, "вторникам": 1, "средам": 2, "четвергам": 3,
+              "пятницам": 4, "субботам": 5, "воскресеньям": 6}
+    m = re.search(r"\bпо\s+(" + "|".join(plural) + r")\b", low)
+    if m:
+        target = plural[m.group(1)]
+        return "weekly", today + timedelta(days=(target - today.weekday()) % 7), _cut(text, m)
+
+    # "каждое 5 число", "каждого 5-го числа"
+    m = re.search(r"\b(?:каждое|каждого)\s+(\d{1,2})(?:-?го|-?е)?\s+числ[оа]\b", low)
+    if m and 1 <= int(m.group(1)) <= 31:
+        day = int(m.group(1))
+        hint = _month_day(today.year, today.month, day)
+        if hint < today:
+            y, mo = _add_month(today)
+            hint = _month_day(y, mo, day)
+        return "monthly", hint, _cut(text, m)
+
+    return None, None, text
+
+
 def parse_task(text: str, now: datetime) -> dict:
     """Главная функция: разбирает сообщение пользователя на части."""
     original = text.strip()
     rest = original
 
     due_time, rest = extract_time(rest)
+    repeat_kind, repeat_hint, rest = extract_repeat(rest, now.date())
     due_date, rest = extract_date(rest, now.date())
     place, rest = extract_place(rest)
     person, rest = extract_person(rest)
+
+    repeat = None
+    if repeat_kind:
+        explicit_date = due_date is not None
+        if not due_date:
+            # "каждую неделю"/"каждый месяц"/"каждый год" без даты — начинаем с сегодняшнего дня
+            due_date = repeat_hint or (
+                now.date() if repeat_kind in ("weekly", "monthly", "yearly")
+                else first_occurrence(repeat_kind, now.date())
+            )
+        repeat = make_repeat(repeat_kind, due_date)
+        # Если дата не названа явно, а время сегодня уже прошло — первый раз будет в следующий подходящий день
+        if (not explicit_date and due_time
+                and datetime.combine(due_date, due_time) <= now.replace(tzinfo=None)):
+            due_date = next_date(repeat, due_date)
 
     # Если указано только время — считаем, что это сегодня (или завтра, если время уже прошло)
     if due_time and not due_date:
@@ -233,6 +392,7 @@ def parse_task(text: str, now: datetime) -> dict:
         "due_time": due_time,
         "place": place,
         "person": person,
+        "repeat": repeat,
     }
 
 

@@ -58,6 +58,7 @@ def init_db():
         # Новые поля добавляем отдельно, чтобы у тех, кто уже пользуется ботом,
         # база обновилась автоматически и задачи не пропали.
         _add_missing_columns(conn, "users", USER_SETTINGS_COLUMNS)
+        _add_missing_columns(conn, "tasks", TASK_EXTRA_COLUMNS)
 
 
 # Настройки пользователя (хранятся в таблице users)
@@ -68,6 +69,12 @@ USER_SETTINGS_COLUMNS = {
     "weather_time": "TEXT DEFAULT '08:00'",    # во сколько присылать прогноз
     "weather_enabled": "INTEGER DEFAULT 0",    # 1 — присылать каждый день
     "weather_last_sent": "TEXT",               # дата последней отправки
+}
+
+
+# Поля задач, добавленные в новых версиях бота
+TASK_EXTRA_COLUMNS = {
+    "repeat": "TEXT",   # правило повтора ("daily", "weekly:2", ...) или пусто
 }
 
 
@@ -158,19 +165,24 @@ def _t(value):
     return value.strftime("%H:%M") if isinstance(value, time) else value
 
 
-def add_task(user_id, title, place, person, due_date, due_time, now: datetime) -> int:
+def add_task(user_id, title, place, person, due_date, due_time, now: datetime, repeat=None) -> int:
     r1, s1, r2, s2 = calc_reminders(due_date, due_time, now)
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO tasks (user_id, title, place, person, due_date, due_time, created_at,
-                               remind1_at, remind1_sent, remind2_at, remind2_sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               remind1_at, remind1_sent, remind2_at, remind2_sent, repeat)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, title, place, person, _d(due_date), _t(due_time), _fmt(now),
-             r1, s1, r2, s2),
+             r1, s1, r2, s2, repeat),
         )
         return cur.lastrowid
+
+
+def set_repeat(task_id: int, user_id: int, repeat):
+    with connect() as conn:
+        conn.execute("UPDATE tasks SET repeat = ? WHERE id = ? AND user_id = ?", (repeat, task_id, user_id))
 
 
 def get_task(task_id: int, user_id: int):
@@ -236,6 +248,9 @@ def update_when(task_id: int, user_id: int, due_date, due_time, now: datetime):
             """,
             (_d(due_date), _t(due_time), r1, s1, r2, s2, task_id, user_id),
         )
+        if due_date is None:
+            # У задачи без срока повтор не имеет смысла
+            conn.execute("UPDATE tasks SET repeat = NULL WHERE id = ? AND user_id = ?", (task_id, user_id))
 
 
 def update_text(task_id: int, user_id: int, title, place, person):
