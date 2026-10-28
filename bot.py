@@ -13,7 +13,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -171,45 +171,52 @@ def kb(rows) -> InlineKeyboardMarkup:
     )
 
 
-# Постоянное меню внизу экрана (под полем ввода). Нажатие на кнопку отправляет её текст.
-NAV_TODAY, NAV_TASKS, NAV_NEW = "◉ Сегодня", "≡ Задачи", "+ Задача"
-NAV_TABS, NAV_REPORTS, NAV_SETTINGS = "▤ Вкладки", "◔ Отчёты", "⋯ Настройки"
-REPLY_KB = ReplyKeyboardMarkup(
-    [[NAV_TODAY, NAV_TASKS, NAV_NEW], [NAV_TABS, NAV_REPORTS, NAV_SETTINGS]],
-    resize_keyboard=True, is_persistent=True,
-    input_field_placeholder="Напишите задачу, например: завтра в 10 позвонить маме",
-)
-
-BACK_TO_MENU = kb([[("⌂  Сегодня", "menu")]])
-
-
-def draft_keyboard(d: dict):
-    rows = [[("✓  Сохранить", "draft_save")]]
-    if d["due_date"]:
-        rows.append([("Дата и время", "draft_when")])
-    else:
-        # Даты нет — сразу предлагаем самые частые варианты
-        rows.append([("Сегодня", "draft_day:0"), ("Завтра", "draft_day:1"), ("Другая дата", "draft_when")])
-    rows.append([("↻  Повтор", "repmenu:d"), ("▤  Вкладка", "dtab"), ("✕  Отмена", "menu")])
+def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    """Главное меню: «Все задачи», под ними вкладки пользователя."""
+    counts = db.count_active_by_category(user_id)
+    total = sum(counts.values())
+    rows = [
+        [("+  Новая задача", "new")],
+        [(f"≡  Все задачи · {total}" if total else "≡  Все задачи", "list:all:0")],
+    ]
+    tabs = [(f"▸  {c['name']} · {counts[c['id']]}" if counts.get(c["id"]) else f"▸  {c['name']}",
+             f"list:all:{c['id']}") for c in db.get_categories(user_id)]
+    rows += [tabs[i:i + 2] for i in range(0, len(tabs), 2)]  # по две вкладки в ряд
+    rows.append([("▤  Новая вкладка", "tabnew")])
+    rows.append([("✓  Выполненные", "done_list"), ("⋯  Настройки", "settings")])
     return kb(rows)
+
+
+BACK_TO_MENU = kb([[("⌂  Главное меню", "menu")]])
+
+
+def draft_keyboard():
+    return kb([
+        [("✓  Сохранить", "draft_save")],
+        [("Дата и время", "draft_when"), ("↻  Повтор", "repmenu:d")],
+        [("▤  Вкладка", "dtab"), ("✎  Заново", "new")],
+        [("✕  Отмена", "menu")],
+    ])
 
 
 def task_keyboard(task):
     tid = task["id"]
     if task["status"] == "done":
         return kb([
-            [("↺  Вернуть в текущие", f"undone:{tid}"), ("✕  Удалить", f"del:{tid}")],
-            [("←  Назад", "back")],
+            [("↺  Вернуть в текущие", f"undone:{tid}")],
+            [("✕  Удалить", f"del:{tid}")],
+            [("←  Выполненные", "done_list"), ("⌂  Меню", "menu")],
         ])
-    first = [("✓  Выполнено", f"done:{tid}")]
+    rows = [[("✓  Выполнено", f"done:{tid}")]]
     if task["repeat"]:
-        first.append(("»  Пропустить", f"skip:{tid}"))
-    return kb([
-        first,
-        [("+1 день", f"shift:{tid}:d1"), ("+1 неделя", f"shift:{tid}:w1"), ("Дата…", f"resched:{tid}")],
-        [("✎  Текст", f"edit:{tid}"), ("↻  Повтор", f"repmenu:{tid}"), ("▤  Вкладка", f"move:{tid}")],
-        [("✕  Удалить", f"del:{tid}"), ("←  Назад", "back")],
-    ])
+        rows.append([("»  Пропустить этот раз", f"skip:{tid}")])
+    rows += [
+        [("→  Перенести", f"resched:{tid}"), ("✎  Изменить", f"edit:{tid}")],
+        [("↻  Повтор", f"repmenu:{tid}"), ("▤  Вкладка", f"move:{tid}")],
+        [("✕  Удалить", f"del:{tid}")],
+        [("←  К списку", "list:back"), ("⌂  Меню", "menu")],
+    ]
+    return kb(rows)
 
 
 # ---------- Вспомогательное ----------
@@ -222,7 +229,7 @@ def allowed(update: Update) -> bool:
 def greeting(update: Update) -> str:
     name = html.escape(update.effective_user.first_name or "")
     return (f"<b>Здравствуйте, {name}.</b>\n\n"
-            "Меню — внизу экрана. Задачу можно просто написать сообщением:\n"
+            "Планировщик задач. Выберите раздел или просто напишите задачу сообщением.\n\n"
             "<blockquote>6 числа встреча по адресу ул. Ленина 5 с Иваном в 15:00</blockquote>")
 
 
@@ -256,14 +263,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     context.user_data.clear()
-    # Первое сообщение включает меню внизу экрана, второе — экран «Сегодня»
-    await update.effective_chat.send_message(greeting(update), reply_markup=REPLY_KB, parse_mode=ParseMode.HTML)
-    await show_today(update, context, new_message=True)
+    await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """«Главная» — это экран «Сегодня»."""
-    await show_today(update, context)
+    context.user_data.clear()
+    await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
 # ---------- Создание задачи ----------
@@ -296,7 +301,7 @@ async def show_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d["title"], d["place"], d["person"], d["due_date"], d["due_time"], extra, d.get("repeat"),
         tab_name(d.get("category_id"), update.effective_user.id)
     )
-    await reply_or_edit(update, text, draft_keyboard(d))
+    await reply_or_edit(update, text, draft_keyboard())
 
 
 async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,134 +322,38 @@ async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     repeat=d.get("repeat"), tab=tab_name(d.get("category_id"), update.effective_user.id))
         + note,
         kb([[("+  Ещё задача", f"newin:{d.get('category_id') or 0}"),
-             ("≡  К задачам", f"tl:{d.get('category_id') or 0}:0")],
-            [("⌂  Сегодня", "menu")]]),
+             ("≡  К списку", f"list:all:{d.get('category_id') or 0}")],
+            [("⌂  Главное меню", "menu")]]),
     )
 
 
-# ---------- Экран «Сегодня» и списки задач ----------
+# ---------- Списки задач ----------
 
-PAGE_SIZE = 10
-SECTIONS = ["Просрочено", "Сегодня", "Завтра", "На неделе", "Позже", "Без срока"]
-WEEKDAYS_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-
-
-def section_of(task, today: date) -> int:
-    """Номер раздела списка (см. SECTIONS) для задачи."""
-    if not task["due_date"]:
-        return 5
-    d = date.fromisoformat(task["due_date"])
-    if d < today:
-        return 0
-    if d == today:
-        return 1
-    if d == today + timedelta(days=1):
-        return 2
-    return 3 if d <= today + timedelta(days=7) else 4
+FILTERS = {
+    "today": "Сегодня",
+    "week": "7 дней",
+    "month": "30 дней",
+    "all": "Все",
+}
 
 
-def list_line(num: int, task, section: int, tab: str = None) -> str:
-    """Строка задачи в списке: «3. пт 30.10 · 19:00 · Футбол ↻ · Учёба»."""
-    when = []
-    if task["due_date"] and section in (0, 3, 4):
-        d = date.fromisoformat(task["due_date"])
-        when.append(f"{WEEKDAY_NAMES[d.weekday()]} {d.strftime('%d.%m')}" if section == 3 else d.strftime("%d.%m"))
-    if task["due_time"]:
-        when.append(task["due_time"])
-    line = f"{num}. " + (" · ".join(when) + " · " if when else "") + html.escape(task["title"])
-    if task["repeat"]:
-        line += " ↻"
-    if tab:
-        line += f" · <i>{html.escape(tab)}</i>"
-    return line
+def filter_tasks(tasks, period: str):
+    if period == "all":
+        return tasks
+    today = now().date()
+    end = {"today": today, "week": today + timedelta(days=6), "month": today + timedelta(days=29)}[period]
+    result = []
+    for t in tasks:
+        if not t["due_date"]:
+            continue
+        d = date.fromisoformat(t["due_date"])
+        if d <= end:  # просроченные тоже показываем, чтобы о них не забыть
+            result.append(t)
+    return result
 
 
-def progress_bar(done: int, total: int) -> str:
-    filled = round(done * 10 / total) if total else 0
-    return "■" * filled + "□" * (10 - filled)
-
-
-def today_label(task, today: date) -> str:
-    """Подпись кнопки в чек-листе «Сегодня»: ○ — не сделано, ✓ — сделано, ! — просрочено."""
-    if task["status"] == "done":
-        mark = "✓"
-    elif task["due_date"] < today.isoformat():
-        mark = "!"
-    else:
-        mark = "○"
-    when = task["due_time"] or ""
-    if task["due_date"] < today.isoformat():
-        when = date.fromisoformat(task["due_date"]).strftime("%d.%m")
-    label = f"{mark}  " + (f"{when}  " if when else "") + task["title"]
-    return label if len(label) <= 60 else label[:57] + "…"
-
-
-async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str = "check",
-                     new_message: bool = False):
-    """
-    Главный экран: прогресс за сегодня и чек-лист задач.
-    mode="check" — нажатие отмечает задачу выполненной (и снимает отметку),
-    mode="open"  — нажатие открывает карточку задачи.
-    """
-    uid = update.effective_user.id
-    context.user_data.clear()
-    context.chat_data["back"] = "td" if mode == "check" else "td:open"
-    n = now()
-    today = n.date()
-
-    todays = db.tasks_for_period(uid, today, today)
-    overdue = [t for t in db.get_active_tasks(uid) if t["due_date"] and t["due_date"] < today.isoformat()]
-    done = sum(t["status"] == "done" for t in todays)
-    tomorrow = len(db.tasks_for_period(uid, today + timedelta(days=1), today + timedelta(days=1)))
-
-    text = header("Сегодня", f"{WEEKDAYS_FULL[today.weekday()]}, {today.day} {MONTH_NAMES[today.month - 1]}")
-    text += "\n\n"
-    if todays:
-        text += f"<code>{progress_bar(done, len(todays))}</code>  {done} из {len(todays)} выполнено\n"
-    else:
-        text += "На сегодня задач нет.\n"
-    extra = []
-    if overdue:
-        extra.append(f"просрочено: {len(overdue)}")
-    if tomorrow:
-        extra.append(f"на завтра: {tomorrow}")
-    if extra:
-        text += "<i>" + " · ".join(extra).capitalize() + "</i>\n"
-    if todays or overdue:
-        text += ("\nНажмите на задачу — она отметится выполненной. Ещё раз — отметка снимется."
-                 if mode == "check" else "\nНажмите на задачу, чтобы открыть её.")
-
-    rows = []
-    for t in overdue + todays:
-        cb = f"tq:{t['id']}" if mode == "check" else f"task:{t['id']}"
-        rows.append([(today_label(t, today), cb)])
-    switch = ("✎  Открыть задачу", "td:open") if mode == "check" else ("✓  Режим отметок", "td")
-    rows.append([("+  Задача", "newin:0"), switch])
-    rows.append([("≡  Все задачи", "tl:0:0"), ("▤  Вкладки", "tabs")])
-    if new_message:
-        await update.effective_chat.send_message(text, reply_markup=kb(rows), parse_mode=ParseMode.HTML)
-    else:
-        await reply_or_edit(update, text, kb(rows))
-
-
-async def toggle_today(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    """Чек-лист «Сегодня»: отметить задачу выполненной или снять отметку."""
-    uid = update.effective_user.id
-    task = db.get_task(task_id, uid)
-    if not task:
-        await answer_query(update)
-    elif task["status"] == "active":
-        next_id = complete_task(uid, task, now())
-        context.chat_data.setdefault("undo", {})[task_id] = next_id
-        await answer_query(update, "Выполнено")
-    else:
-        uncomplete_task(uid, task_id, context.chat_data.get("undo", {}).pop(task_id, None))
-        await answer_query(update, "Отметка снята")
-    await show_today(update, context)
-
-
-async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int = 0, page: int = 0):
-    """Все текущие задачи (cat = 0) или задачи одной вкладки, по разделам и страницам."""
+async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str = "all", cat: int = 0):
+    """Список текущих задач. cat = 0 — все задачи, иначе номер вкладки."""
     uid = update.effective_user.id
     tab = db.get_category(cat, uid) if cat else None
     if cat and not tab:
@@ -452,88 +361,40 @@ async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: in
     context.user_data.clear()
     # Если пользователь, находясь во вкладке, просто напишет задачу — она попадёт сюда
     context.user_data["new_cat"] = cat or None
-    context.chat_data["back"] = f"tl:{cat}:{page}"
+    # Запоминаем, какой список открыт, чтобы кнопка «К списку» вела обратно сюда
+    context.chat_data["last_list"] = (period, cat)
 
-    today = now().date()
-    tabs = db.get_categories(uid)
-    names = {c["id"]: c["name"] for c in tabs}
-    tasks = sorted(db.get_active_tasks(uid, cat or None), key=lambda t: section_of(t, today))
-    pages = max(1, -(-len(tasks) // PAGE_SIZE))
-    page = min(max(page, 0), pages - 1)
-    shown = tasks[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    tasks = filter_tasks(db.get_active_tasks(uid, cat or None), period)
+    names = {} if cat else {c["id"]: c["name"] for c in db.get_categories(uid)}
 
-    text = header(tab["name"] if cat else "Все задачи",
-                  f"{len(tasks)} {plural(len(tasks), 'задача', 'задачи', 'задач')}"
-                  + (f" · стр. {page + 1} из {pages}" if pages > 1 else ""))
-    last_section = None
-    for i, t in enumerate(shown, start=page * PAGE_SIZE + 1):
-        sec = section_of(t, today)
-        if sec != last_section:
-            text += f"\n\n<b>{SECTIONS[sec]}</b>"
-            last_section = sec
-        text += "\n" + list_line(i, t, sec, None if cat else names.get(t["category_id"]))
-    if not tasks:
-        text += "\n\nЗадач нет."
-    else:
-        text += "\n\n<i>Нажмите номер, чтобы открыть задачу.</i>"
+    filter_row = [((("● " + name) if key == period else name), f"list:{key}:{cat}")
+                  for key, name in FILTERS.items()]
+    rows = [filter_row]
+    rows += [[(short_label(t, names.get(t["category_id"])), f"task:{t['id']}")] for t in tasks[:40]]
     if cat:
-        text += "\n<i>Новую задачу можно просто написать — она попадёт в эту вкладку.</i>"
-
-    rows = []
-    # Переключатель вкладок сверху: «Все» и вкладки пользователя
-    if tabs:
-        chips = [(("● " if not cat else "") + "Все", "tl:0:0")]
-        chips += [(("● " if cat == c["id"] else "") + c["name"][:14], f"tl:{c['id']}:0") for c in tabs]
-        rows += [chips[i:i + 3] for i in range(0, len(chips), 3)]
-    numbers = [(str(i), f"task:{t['id']}") for i, t in enumerate(shown, start=page * PAGE_SIZE + 1)]
-    rows += [numbers[i:i + 5] for i in range(0, len(numbers), 5)]
-    if pages > 1:
-        rows.append([("◀", f"tl:{cat}:{page - 1}" if page else "noop"),
-                     (f"{page + 1} / {pages}", "noop"),
-                     ("▶", f"tl:{cat}:{page + 1}" if page < pages - 1 else "noop")])
-    bottom = [("+  Задача", f"newin:{cat}"), ("✓  Выполненные", "done_list")]
-    if cat:
-        bottom.append(("⋯  Вкладка", f"tabopt:{cat}"))
-    rows.append(bottom)
-    await reply_or_edit(update, text, kb(rows))
-
-
-async def show_tabs(update: Update, context: ContextTypes.DEFAULT_TYPE, note: str = ""):
-    """Список вкладок с количеством задач и ближайшим сроком."""
-    uid = update.effective_user.id
-    context.user_data.clear()
-    tabs = db.get_categories(uid)
-    counts = db.count_active_by_category(uid)
-    text = header("Вкладки") + "\n\n"
-    if note:
-        text += note + "\n\n"
-    if tabs:
-        lines = []
-        for c in tabs:
-            n_tasks = counts.get(c["id"], 0)
-            dated = [t["due_date"] for t in db.get_active_tasks(uid, c["id"]) if t["due_date"]]
-            nearest = f" · ближайшая {date.fromisoformat(min(dated)).strftime('%d.%m')}" if dated else ""
-            lines.append(f"<b>{html.escape(c['name'])}</b> — {n_tasks} "
-                         f"{plural(n_tasks, 'задача', 'задачи', 'задач')}{nearest}")
-        general = counts.get(None, 0)
-        if general:
-            lines.append(f"<i>Без вкладки — {general} {plural(general, 'задача', 'задачи', 'задач')}</i>")
-        text += "\n".join(lines)
+        rows.append([("+  Задача во вкладку", f"newin:{cat}"), ("⋯  Вкладка", f"tabopt:{cat}")])
+        rows.append([("≡  Все задачи", "list:all:0"), ("⌂  Меню", "menu")])
     else:
-        text += ("Вкладки — это разделы для задач, например «Учёба» или «Работа».\n"
-                 "Создайте первую вкладку кнопкой ниже.")
-    names = [(c["name"][:20], f"tl:{c['id']}:0") for c in tabs]
-    rows = [names[i:i + 2] for i in range(0, len(names), 2)]
-    rows.append([("≡  Все задачи", "tl:0:0"), ("+  Новая вкладка", "tabnew")])
+        rows.append([("+  Новая задача", "new"), ("⌂  Меню", "menu")])
+
+    title = tab["name"] if cat else "Все задачи"
+    text = header(title, f"{FILTERS[period]} · {len(tasks)}") + "\n\n"
+    if tasks:
+        text += "Выберите задачу, чтобы отметить, перенести или изменить её."
+        if len(tasks) > 40:
+            text += "\nПоказаны первые 40."
+    else:
+        text += "Задач нет."
+    if cat:
+        text += "\n<i>Новую задачу можно просто написать сообщением — она попадёт в эту вкладку.</i>"
     await reply_or_edit(update, text, kb(rows))
 
 
 async def show_done_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     tasks = db.get_done_tasks(update.effective_user.id)
-    context.chat_data["back"] = "done_list"
     rows = [[("✓ " + short_label(t), f"task:{t['id']}")] for t in tasks]
-    rows.append([("≡  Текущие задачи", "tl:0:0"), ("⌂  Сегодня", "menu")])
+    rows.append([("⌂  Главное меню", "menu")])
     if tasks:
         text = header("Выполненные задачи", f"Показано: {len(tasks)}") + "\n\nВыберите задачу, чтобы открыть её."
     else:
@@ -614,47 +475,28 @@ async def ask_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: 
     ]))
 
 
-def complete_task(uid: int, task, n: datetime):
-    """
-    Отмечает задачу выполненной. У повторяющейся создаёт следующий раз (а у выполненной копии
-    повтор убирает). Возвращает номер созданной задачи или None — он нужен, чтобы отменить отметку.
-    """
-    db.set_done(task["id"], uid, n)
-    if not (task["repeat"] and task["due_date"]):
-        return None
-    nxt = next_run(task, n)
-    due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-    next_id = db.add_task(uid, task["title"], task["place"], task["person"], nxt, due_time, n,
-                          task["repeat"], task["category_id"])
-    db.set_repeat(task["id"], uid, None)
-    return next_id
-
-
-def uncomplete_task(uid: int, task_id: int, next_id=None):
-    """Снимает отметку «выполнено». Если был создан следующий раз повтора — убирает его обратно."""
-    db.set_active(task_id, uid)
-    nxt = db.get_task(next_id, uid) if next_id else None
-    if nxt and nxt["status"] == "active":
-        db.set_repeat(task_id, uid, nxt["repeat"])
-        db.delete_task(next_id, uid)
-
-
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
     uid = update.effective_user.id
     task = db.get_task(task_id, uid)
     if not task or task["status"] == "done":
         await answer_query(update)
         return
-    next_id = complete_task(uid, task, now())
+    n = now()
+    db.set_done(task_id, uid, n)
     await answer_query(update, "Задача выполнена")
     note = ""
-    if next_id:
-        nxt = db.get_task(next_id, uid)
-        when = fmt_date(nxt["due_date"]) + (f" · {nxt['due_time']}" if nxt["due_time"] else "")
+    if task["repeat"] and task["due_date"]:
+        # Повторяющаяся задача: создаём следующий раз, а у выполненной копии повтор убираем
+        nxt = next_run(task, n)
+        due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
+        db.add_task(uid, task["title"], task["place"], task["person"], nxt, due_time, n, task["repeat"],
+                    task["category_id"])
+        db.set_repeat(task_id, uid, None)
+        when = fmt_date(nxt) + (f" · {task['due_time']}" if task["due_time"] else "")
         note = f"\n<i>Следующий раз — {when}</i>"
     await reply_or_edit(update, header("Задача выполнена") + "\n\n" + card_from_row(db.get_task(task_id, uid))
                         + note,
-                        kb([[("↺  Отменить", f"undo:{task_id}:{next_id or 0}"), ("←  Назад", "back")]]))
+                        kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
 
 
 def next_run(task, n: datetime):
@@ -773,7 +615,7 @@ async def ask_tab_name(update: Update, context: ContextTypes.DEFAULT_TYPE, renam
         title, back = "Переименовать вкладку", f"tabopt:{rename_id}"
     else:
         context.user_data["state"] = WAIT_TAB_NAME
-        title, back = "Новая вкладка", "tabs"
+        title, back = "Новая вкладка", "menu"
     await reply_or_edit(update, header(title) + "\n\nНапишите название, например <code>Учёба</code> "
                         "или <code>Работа</code>.", kb([[("←  Назад", back)]]))
 
@@ -803,7 +645,7 @@ async def show_tab_options(update: Update, context: ContextTypes.DEFAULT_TYPE, c
     await reply_or_edit(update, header(tab["name"], "Вкладка") + f"\n\nТекущих задач: {n}", kb([
         [("Отчёт: неделя", f"r_now:week:{cat}"), ("Отчёт: месяц", f"r_now:month:{cat}")],
         [("✎  Переименовать", f"tabren:{cat}"), ("✕  Удалить", f"tabdel:{cat}")],
-        [("←  Назад", f"tl:{cat}:0")],
+        [("←  Назад", f"list:all:{cat}")],
     ]))
 
 
@@ -830,7 +672,7 @@ async def ask_tab_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, cat
 
 async def delete_tab(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int, mode: str):
     db.delete_category(cat, update.effective_user.id, with_tasks=(mode == "all"))
-    await show_tabs(update, context, "<i>Вкладка удалена.</i>")
+    await reply_or_edit(update, header("Вкладка удалена"), main_menu(update.effective_user.id))
 
 
 async def show_tab_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
@@ -881,7 +723,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сюда будут добавляться новые разделы настроек
     await reply_or_edit(update, header("Настройки") + "\n\nВыберите раздел.", kb([
         [("Погода", "w_settings"), ("Отчёты", "r_settings")],
-        [("⌂  Сегодня", "menu")],
+        [("⌂  Главное меню", "menu")],
     ]))
 
 
@@ -909,7 +751,7 @@ async def show_weather_settings(update: Update, context: ContextTypes.DEFAULT_TY
         rows.append([("Время прогноза", "w_time"),
                      ("○  Выключить" if enabled else "●  Включить", "w_toggle")])
         rows.append([("Погода сейчас", "w_now")])
-    rows.append([("←  Настройки", "settings"), ("⌂  Сегодня", "menu")])
+    rows.append([("←  Настройки", "settings"), ("⌂  Меню", "menu")])
     await reply_or_edit(update, "\n".join(lines), kb(rows))
 
 
@@ -1018,13 +860,10 @@ def mark_report_sent_if_time_passed(user_id: int, kind: str, r_time: str):
 async def show_report_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, note: str = ""):
     context.user_data.clear()
     user = db.get_user(update.effective_user.id)
-    lines = [header("Отчёты"), ""]
+    lines = [header("Отчёты", "Настройки"), ""]
     if note:
         lines += [note, ""]
-    lines.append("Диаграмма и проценты: сколько задач выполнено, не выполнено и в процессе, "
-                 "с разбивкой по вкладкам.")
-    rows_text = []
-    rows = [[("За неделю", "r_now:week"), ("За месяц", "r_now:month"), ("По вкладке", "r_tabs")]]
+    rows_text, rows = [], []
     for kind in ("week", "month"):
         enabled = user[f"report_{kind}_enabled"]
         r_time = user[f"report_{kind}_time"]
@@ -1032,7 +871,12 @@ async def show_report_settings(update: Update, context: ContextTypes.DEFAULT_TYP
         rows_text.append(f"{REPORT_NAMES[kind]} — {status}")
         rows.append([(f"Время: {'неделя' if kind == 'week' else 'месяц'}", f"r_time:{kind}"),
                      ("○  Выключить" if enabled else "●  Включить", f"r_toggle:{kind}")])
-    lines.append("\n<b>Автоматически</b>\n<blockquote>" + "\n".join(rows_text) + "</blockquote>")
+    lines.append("<blockquote>" + "\n".join(rows_text) + "</blockquote>")
+    lines.append("В отчёте — диаграмма и проценты: сколько задач выполнено, не выполнено и в процессе, "
+                 "и разбивка по вкладкам.")
+    rows.append([("Отчёт за неделю", "r_now:week"), ("Отчёт за месяц", "r_now:month")])
+    rows.append([("▤  Отчёт по вкладке", "r_tabs")])
+    rows.append([("←  Настройки", "settings"), ("⌂  Меню", "menu")])
     await reply_or_edit(update, "\n".join(lines), kb(rows))
 
 
@@ -1079,7 +923,7 @@ async def send_report(bot, user_id: int, kind: str, category_id: int = None):
     period = reports.week_period(n.date()) if kind == "week" else reports.month_period(n.date())
     # Рисование картинки занимает около секунды — делаем это в фоне, чтобы бот не «замирал»
     text, image = await asyncio.to_thread(reports.build, user_id, period, n, category_id)
-    markup = kb([[("≡  К задачам", f"list:all:{category_id or 0}"), ("⌂  Сегодня", "menu")]])
+    markup = kb([[("≡  К задачам", f"list:all:{category_id or 0}"), ("⌂  Меню", "menu")]])
     if image:
         await bot.send_photo(user_id, photo=image, caption=text, parse_mode=ParseMode.HTML, reply_markup=markup)
     else:
@@ -1145,34 +989,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "done":
         await mark_done(update, context, int(arg))
         return  # mark_done сам отвечает на нажатие
-    if action == "tq":
-        await toggle_today(update, context, int(arg))
-        return  # toggle_today сам отвечает на нажатие (всплывающая подсказка)
     await answer_query(update)
 
-    if action in ("menu", "td"):
-        await show_today(update, context, "open" if arg == "open" else "check")
-    elif action == "tl":
-        cat, _, page = arg.partition(":")
-        await show_tasks(update, context, int(cat or 0), int(page or 0))
-    elif action == "tabs":
-        await show_tabs(update, context)
-    elif action == "back":
-        # «Назад» из карточки задачи — в тот экран, откуда её открыли
-        back_action, _, back_arg = context.chat_data.get("back", "td").partition(":")
-        if back_action == "tl":
-            cat, _, page = back_arg.partition(":")
-            await show_tasks(update, context, int(cat or 0), int(page or 0))
-        elif back_action == "done_list":
-            await show_done_list(update, context)
-        else:
-            await show_today(update, context, "open" if back_arg == "open" else "check")
-    elif action == "undo":
-        task_id, next_id = (int(x) for x in arg.split(":"))
-        uncomplete_task(update.effective_user.id, task_id, next_id or None)
-        await show_task(update, context, task_id)
-    elif action == "noop":
-        pass
+    if action == "menu":
+        await show_menu(update, context)
     elif action == "settings":
         await show_settings(update, context)
     elif action == "w_settings":
@@ -1212,9 +1032,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "newin":
         await ask_new_task(update, context, int(arg) or None)
     elif action == "list":
-        # Кнопки из старых сообщений (до переработки интерфейса)
-        _, _, cat = arg.partition(":")
-        await show_tasks(update, context, int(cat) if cat.isdigit() else 0)
+        if arg == "back":
+            period, cat = context.chat_data.get("last_list", ("all", 0))
+        else:
+            period, _, cat = arg.partition(":")
+            period, cat = period or "all", int(cat or 0)
+        await show_list(update, context, period, cat)
     elif action == "tabnew":
         await ask_tab_name(update, context)
     elif action == "tabopt":
@@ -1260,7 +1083,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "delyes":
         db.delete_task(int(arg), update.effective_user.id)
         await reply_or_edit(update, header("Задача удалена"),
-                            kb([[("←  Назад", "back"), ("⌂  Сегодня", "menu")]]))
+                            kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
     elif action == "draft_save":
         await save_draft(update, context)
     elif action == "draft_when":
@@ -1321,19 +1144,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     n = now()
 
-    # Кнопки меню внизу экрана работают из любого места (и отменяют незаконченное действие)
-    nav = {
-        NAV_TODAY: lambda: show_today(update, context),
-        NAV_TASKS: lambda: show_tasks(update, context),
-        NAV_NEW: lambda: ask_new_task(update, context),
-        NAV_TABS: lambda: show_tabs(update, context),
-        NAV_REPORTS: lambda: show_report_settings(update, context),
-        NAV_SETTINGS: lambda: show_settings(update, context),
-    }
-    if text in nav:
-        await nav[text]()
-        return
-
     if state == WAIT_CITY:
         try:
             cities = await weather.find_cities(text)
@@ -1370,7 +1180,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cat = existing["id"]  # такая вкладка уже есть — просто открываем её
         else:
             cat = db.add_category(uid, name, n)
-        await show_tasks(update, context, cat)
+        await show_list(update, context, "all", cat)
         return
 
     if state in (WAIT_WEATHER_TIME, WAIT_REPORT_TIME):
@@ -1519,34 +1329,6 @@ async def check_weather(context: ContextTypes.DEFAULT_TYPE):
         db.update_user(user["user_id"], weather_last_sent=today)
 
 
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if allowed(update):
-        await show_today(update, context)
-
-
-async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if allowed(update):
-        await show_tasks(update, context)
-
-
-async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if allowed(update):
-        await ask_new_task(update, context)
-
-
-async def set_commands(app: Application):
-    """Список команд для кнопки «Меню» слева от поля ввода в Telegram."""
-    await app.bot.set_my_commands([
-        BotCommand("today", "Сегодня"),
-        BotCommand("tasks", "Все задачи"),
-        BotCommand("new", "Новая задача"),
-        BotCommand("summary", "Отчёт за неделю"),
-        BotCommand("month", "Отчёт за месяц"),
-        BotCommand("weather", "Погода на сегодня"),
-        BotCommand("start", "Показать меню внизу экрана"),
-    ])
-
-
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Ошибка при обработке сообщения", exc_info=context.error)
 
@@ -1563,15 +1345,12 @@ def main():
         )
 
     db.init_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("weather", weather_command))
     app.add_handler(CommandHandler("month", month_command))
-    app.add_handler(CommandHandler("today", today_command))
-    app.add_handler(CommandHandler("tasks", tasks_command))
-    app.add_handler(CommandHandler("new", new_command))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
