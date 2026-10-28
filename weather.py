@@ -3,6 +3,8 @@
 Регистрация и ключ не нужны.
 """
 
+import html
+
 import httpx
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -68,21 +70,13 @@ async def find_cities(name: str, count: int = 5) -> list:
     {"name", "lat", "lon", "label"}, где label — "Москва, Москва, Россия".
     """
     data = await _get(GEOCODING_URL, {"name": name, "count": count, "language": "ru", "format": "json"})
-    cities = []
-    for item in data.get("results") or []:
-        parts = [item.get("name"), item.get("admin1"), item.get("country")]
-        # Убираем повторы ("Москва, Москва, Россия" -> "Москва, Россия") и пустые части
-        label_parts = []
-        for p in parts:
-            if p and p not in label_parts:
-                label_parts.append(p)
-        cities.append({
-            "name": item["name"],
-            "lat": item["latitude"],
-            "lon": item["longitude"],
-            "label": ", ".join(label_parts),
-        })
-    return cities
+    return [{
+        "name": item["name"],
+        "lat": item["latitude"],
+        "lon": item["longitude"],
+        # Без повторов и пустых частей: "Москва, Москва, Россия" -> "Москва, Россия"
+        "label": ", ".join(dict.fromkeys(p for p in (item.get("name"), item.get("admin1"), item.get("country")) if p)),
+    } for item in data.get("results") or []]
 
 
 def _fmt_temp(value) -> str:
@@ -90,19 +84,6 @@ def _fmt_temp(value) -> str:
         return "—"
     t = round(value)
     return f"+{t}°" if t > 0 else f"{t}°"
-
-
-async def get_today_forecast(lat: float, lon: float) -> dict:
-    """Загружает прогноз на сегодня (по местному времени выбранного города)."""
-    return await _get(FORECAST_URL, {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m",
-        "daily": "weather_code,wind_speed_10m_max,wind_gusts_10m_max",
-        "wind_speed_unit": "ms",
-        "timezone": "auto",
-        "forecast_days": 1,
-    })
 
 
 def format_forecast(city_name: str, data: dict) -> str:
@@ -115,7 +96,7 @@ def format_forecast(city_name: str, data: dict) -> str:
     temps = data["hourly"]["temperature_2m"]
     by_hour = {int(h[11:13]): t for h, t in zip(hours, temps)}
 
-    lines = [f"<b>ПОГОДА · {city_name.upper()}</b>", "<i>Сегодня</i>", "", condition]
+    lines = [f"<b>ПОГОДА · {html.escape(city_name.upper())}</b>", "<i>Сегодня</i>", "", condition]
 
     wind = daily["wind_speed_10m_max"][0] or 0
     gusts = daily["wind_gusts_10m_max"][0] or 0
@@ -129,5 +110,14 @@ def format_forecast(city_name: str, data: dict) -> str:
 
 
 async def today_text(city_name: str, lat: float, lon: float) -> str:
-    data = await get_today_forecast(lat, lon)
+    """Загружает прогноз на сегодня (по местному времени города) и готовит сообщение."""
+    data = await _get(FORECAST_URL, {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m",
+        "daily": "weather_code,wind_speed_10m_max,wind_gusts_10m_max",
+        "wind_speed_unit": "ms",
+        "timezone": "auto",
+        "forecast_days": 1,
+    })
     return format_forecast(city_name, data)

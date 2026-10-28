@@ -24,17 +24,26 @@ def connect():
         conn.close()
 
 
+def _all(sql: str, params=()):
+    with connect() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def _one(sql: str, params=()):
+    with connect() as conn:
+        return conn.execute(sql, params).fetchone()
+
+
+def _run(sql: str, params=()) -> int:
+    """Выполняет изменение и возвращает номер добавленной строки (для INSERT)."""
+    with connect() as conn:
+        return conn.execute(sql, params).lastrowid
+
+
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при запуске."""
     with connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id    INTEGER PRIMARY KEY,
-                first_name TEXT
-            )
-            """
-        )
+        conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -55,10 +64,6 @@ def init_db():
             )
             """
         )
-        # Новые поля добавляем отдельно, чтобы у тех, кто уже пользуется ботом,
-        # база обновилась автоматически и задачи не пропали.
-        _add_missing_columns(conn, "users", USER_SETTINGS_COLUMNS)
-        _add_missing_columns(conn, "tasks", TASK_EXTRA_COLUMNS)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS categories (
@@ -69,6 +74,13 @@ def init_db():
             )
             """
         )
+        # Новые поля добавляем отдельно, чтобы у тех, кто уже пользуется ботом,
+        # база обновилась автоматически и задачи не пропали.
+        for table, columns in (("users", USER_SETTINGS_COLUMNS), ("tasks", TASK_EXTRA_COLUMNS)):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, sql_type in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
 
 # Настройки пользователя (хранятся в таблице users)
@@ -88,77 +100,44 @@ USER_SETTINGS_COLUMNS = {
     "report_month_last_sent": "TEXT",
 }
 
-
 # Поля задач, добавленные в новых версиях бота
 TASK_EXTRA_COLUMNS = {
     "repeat": "TEXT",          # правило повтора ("daily", "weekly:2", ...) или пусто
     "category_id": "INTEGER",  # вкладка (таблица categories) или пусто — общая задача
 }
 
-
-def _add_missing_columns(conn, table: str, columns: dict):
-    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    for name, sql_type in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+# Поля задачи, которые можно менять через update_task
+TASK_EDITABLE = {"title", "place", "person", "repeat", "category_id", "status", "completed_at"}
 
 
 # ---------- Пользователи ----------
 
 def save_user(user_id: int, first_name: str):
-    with connect() as conn:
-        conn.execute(
-            "INSERT INTO users (user_id, first_name) VALUES (?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name",
-            (user_id, first_name),
-        )
-
-
-def all_users():
-    with connect() as conn:
-        return conn.execute("SELECT * FROM users").fetchall()
+    _run("INSERT INTO users (user_id, first_name) VALUES (?, ?) "
+         "ON CONFLICT(user_id) DO UPDATE SET first_name = excluded.first_name", (user_id, first_name))
 
 
 def get_user(user_id: int):
-    with connect() as conn:
-        return conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return _one("SELECT * FROM users WHERE user_id = ?", (user_id,))
 
 
 def update_user(user_id: int, **fields):
     """Меняет настройки пользователя, например: update_user(1, city_name="Москва")."""
-    for name in fields:
-        if name not in USER_SETTINGS_COLUMNS:
-            raise ValueError(f"Неизвестная настройка: {name}")
+    unknown = set(fields) - set(USER_SETTINGS_COLUMNS)
+    if unknown:
+        raise ValueError(f"Неизвестная настройка: {unknown}")
     sets = ", ".join(f"{name} = ?" for name in fields)
-    with connect() as conn:
-        conn.execute(f"UPDATE users SET {sets} WHERE user_id = ?", (*fields.values(), user_id))
+    _run(f"UPDATE users SET {sets} WHERE user_id = ?", (*fields.values(), user_id))
 
 
-def users_for_report(kind: str, hhmm: str, today: str):
-    """Пользователи, которым пора отправить отчёт kind ("week" или "month")."""
-    assert kind in ("week", "month")
-    with connect() as conn:
-        return conn.execute(
-            f"""
-            SELECT * FROM users
-            WHERE report_{kind}_enabled = 1 AND report_{kind}_time <= ?
-              AND (report_{kind}_last_sent IS NULL OR report_{kind}_last_sent < ?)
-            """,
-            (hhmm, today),
-        ).fetchall()
-
-
-def users_for_weather(hhmm: str, today: str):
-    """Пользователи, которым пора отправить прогноз: время совпало, сегодня ещё не отправляли."""
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM users
-            WHERE weather_enabled = 1 AND city_lat IS NOT NULL
-              AND weather_time <= ? AND (weather_last_sent IS NULL OR weather_last_sent < ?)
-            """,
-            (hhmm, today),
-        ).fetchall()
+def users_due(prefix: str, hhmm: str, today: str, extra: str = ""):
+    """
+    Пользователи, которым пора что-то прислать: рассылка включена, её время наступило,
+    а сегодня ещё не отправляли. prefix — "weather", "report_week" или "report_month".
+    """
+    assert prefix in ("weather", "report_week", "report_month")
+    return _all(f"SELECT * FROM users WHERE {prefix}_enabled = 1 AND {prefix}_time <= ? "
+                f"AND ({prefix}_last_sent IS NULL OR {prefix}_last_sent < ?) {extra}", (hhmm, today))
 
 
 # ---------- Напоминания ----------
@@ -187,6 +166,17 @@ def calc_reminders(due_date, due_time, now: datetime):
     return _fmt(r1), int(r1 <= now), _fmt(r2), int(r2 <= now)
 
 
+def due_reminders(now: datetime):
+    """Задачи, по которым пора отправить напоминание. Возвращает список (задача, номер)."""
+    return [(row, num) for num in (1, 2) for row in _all(
+        f"SELECT * FROM tasks WHERE status = 'active' AND remind{num}_sent = 0 AND remind{num}_at <= ?",
+        (_fmt(now),))]
+
+
+def mark_reminded(task_id: int, num: int):
+    _run(f"UPDATE tasks SET remind{num}_sent = 1 WHERE id = ?", (task_id,))
+
+
 # ---------- Задачи ----------
 
 def _d(value):
@@ -199,30 +189,53 @@ def _t(value):
 
 def add_task(user_id, title, place, person, due_date, due_time, now: datetime, repeat=None,
              category_id=None) -> int:
-    r1, s1, r2, s2 = calc_reminders(due_date, due_time, now)
-    with connect() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO tasks (user_id, title, place, person, due_date, due_time, created_at,
-                               remind1_at, remind1_sent, remind2_at, remind2_sent, repeat, category_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, title, place, person, _d(due_date), _t(due_time), _fmt(now),
-             r1, s1, r2, s2, repeat, category_id),
-        )
-        return cur.lastrowid
-
-
-def set_repeat(task_id: int, user_id: int, repeat):
-    with connect() as conn:
-        conn.execute("UPDATE tasks SET repeat = ? WHERE id = ? AND user_id = ?", (repeat, task_id, user_id))
+    return _run(
+        """
+        INSERT INTO tasks (user_id, title, place, person, due_date, due_time, created_at,
+                           remind1_at, remind1_sent, remind2_at, remind2_sent, repeat, category_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, title, place, person, _d(due_date), _t(due_time), _fmt(now),
+         *calc_reminders(due_date, due_time, now), repeat, category_id),
+    )
 
 
 def get_task(task_id: int, user_id: int):
-    with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
-        ).fetchone()
+    return _one("SELECT * FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+
+
+def update_task(task_id: int, user_id: int, **fields):
+    """Меняет поля задачи, например: update_task(5, 1, repeat=None, category_id=2)."""
+    unknown = set(fields) - TASK_EDITABLE
+    if unknown:
+        raise ValueError(f"Неизвестное поле задачи: {unknown}")
+    sets = ", ".join(f"{name} = ?" for name in fields)
+    _run(f"UPDATE tasks SET {sets} WHERE id = ? AND user_id = ?", (*fields.values(), task_id, user_id))
+
+
+def set_done(task_id: int, user_id: int, now: datetime):
+    update_task(task_id, user_id, status="done", completed_at=_fmt(now))
+
+
+def set_active(task_id: int, user_id: int):
+    update_task(task_id, user_id, status="active", completed_at=None)
+
+
+def update_when(task_id: int, user_id: int, due_date, due_time, now: datetime):
+    """Перенос задачи: новая дата/время и пересчёт напоминаний. Без срока повтор снимается."""
+    _run(
+        """
+        UPDATE tasks SET due_date = ?, due_time = ?,
+               remind1_at = ?, remind1_sent = ?, remind2_at = ?, remind2_sent = ?,
+               repeat = CASE WHEN ? IS NULL THEN NULL ELSE repeat END
+        WHERE id = ? AND user_id = ?
+        """,
+        (_d(due_date), _t(due_time), *calc_reminders(due_date, due_time, now), _d(due_date), task_id, user_id),
+    )
+
+
+def delete_task(task_id: int, user_id: int):
+    _run("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
 
 
 def get_active_tasks(user_id: int, category_id: int = None):
@@ -232,59 +245,49 @@ def get_active_tasks(user_id: int, category_id: int = None):
     """
     where = "" if category_id is None else "AND category_id = ?"
     params = (user_id,) if category_id is None else (user_id, category_id)
-    with connect() as conn:
-        return conn.execute(
-            f"""
-            SELECT * FROM tasks WHERE user_id = ? AND status = 'active' {where}
-            ORDER BY due_date IS NULL, due_date, due_time IS NULL, due_time, id
-            """,
-            params,
-        ).fetchall()
+    return _all(f"SELECT * FROM tasks WHERE user_id = ? AND status = 'active' {where} "
+                "ORDER BY due_date IS NULL, due_date, due_time IS NULL, due_time, id", params)
 
 
-def set_category(task_id: int, user_id: int, category_id):
-    with connect() as conn:
-        conn.execute("UPDATE tasks SET category_id = ? WHERE id = ? AND user_id = ?",
-                     (category_id, task_id, user_id))
+def get_done_tasks(user_id: int, limit: int = 30):
+    return _all("SELECT * FROM tasks WHERE user_id = ? AND status = 'done' ORDER BY completed_at DESC LIMIT ?",
+                (user_id, limit))
+
+
+def tasks_for_period(user_id: int, start: date, end: date):
+    """Все задачи (и выполненные, и нет) со сроком в промежутке [start, end]."""
+    return _all("SELECT * FROM tasks WHERE user_id = ? AND due_date BETWEEN ? AND ? ORDER BY due_date, due_time",
+                (user_id, start.isoformat(), end.isoformat()))
+
+
+def done_without_date(user_id: int, start: date, end: date):
+    """Задачи без срока, выполненные в промежутке [start, end]."""
+    return _all("SELECT * FROM tasks WHERE user_id = ? AND due_date IS NULL AND status = 'done' "
+                "AND substr(completed_at, 1, 10) BETWEEN ? AND ?", (user_id, start.isoformat(), end.isoformat()))
 
 
 # ---------- Вкладки ----------
 
 def get_categories(user_id: int):
-    with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM categories WHERE user_id = ? ORDER BY id", (user_id,)
-        ).fetchall()
+    return _all("SELECT * FROM categories WHERE user_id = ? ORDER BY id", (user_id,))
 
 
 def get_category(category_id: int, user_id: int):
-    with connect() as conn:
-        return conn.execute(
-            "SELECT * FROM categories WHERE id = ? AND user_id = ?", (category_id, user_id)
-        ).fetchone()
+    return _one("SELECT * FROM categories WHERE id = ? AND user_id = ?", (category_id, user_id))
 
 
 def find_category(user_id: int, name: str):
-    """Вкладка с таким названием (без учёта регистра) или None."""
-    for c in get_categories(user_id):
-        if c["name"].lower() == name.lower():
-            return c
-    return None
+    """Вкладка с таким названием без учёта регистра (сравниваем в Python:
+    в SQLite lower() не понимает русские буквы) или None."""
+    return next((c for c in get_categories(user_id) if c["name"].lower() == name.lower()), None)
 
 
 def add_category(user_id: int, name: str, now: datetime) -> int:
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO categories (user_id, name, created_at) VALUES (?, ?, ?)",
-            (user_id, name, _fmt(now)),
-        )
-        return cur.lastrowid
+    return _run("INSERT INTO categories (user_id, name, created_at) VALUES (?, ?, ?)", (user_id, name, _fmt(now)))
 
 
 def rename_category(category_id: int, user_id: int, name: str):
-    with connect() as conn:
-        conn.execute("UPDATE categories SET name = ? WHERE id = ? AND user_id = ?",
-                     (name, category_id, user_id))
+    _run("UPDATE categories SET name = ? WHERE id = ? AND user_id = ?", (name, category_id, user_id))
 
 
 def delete_category(category_id: int, user_id: int, with_tasks: bool):
@@ -300,112 +303,6 @@ def delete_category(category_id: int, user_id: int, with_tasks: bool):
 
 def count_active_by_category(user_id: int) -> dict:
     """{id вкладки: число текущих задач}; ключ None — общие задачи."""
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT category_id, COUNT(*) AS n FROM tasks WHERE user_id = ? AND status = 'active' "
-            "GROUP BY category_id", (user_id,),
-        ).fetchall()
+    rows = _all("SELECT category_id, COUNT(*) AS n FROM tasks WHERE user_id = ? AND status = 'active' "
+                "GROUP BY category_id", (user_id,))
     return {r["category_id"]: r["n"] for r in rows}
-
-
-def get_done_tasks(user_id: int, limit: int = 30):
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM tasks WHERE user_id = ? AND status = 'done'
-            ORDER BY completed_at DESC LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
-
-
-def set_done(task_id: int, user_id: int, now: datetime):
-    with connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ? AND user_id = ?",
-            (_fmt(now), task_id, user_id),
-        )
-
-
-def set_active(task_id: int, user_id: int):
-    with connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status = 'active', completed_at = NULL WHERE id = ? AND user_id = ?",
-            (task_id, user_id),
-        )
-
-
-def delete_task(task_id: int, user_id: int):
-    with connect() as conn:
-        conn.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
-
-
-def update_when(task_id: int, user_id: int, due_date, due_time, now: datetime):
-    """Перенос задачи: новая дата/время и пересчёт напоминаний."""
-    r1, s1, r2, s2 = calc_reminders(due_date, due_time, now)
-    with connect() as conn:
-        conn.execute(
-            """
-            UPDATE tasks SET due_date = ?, due_time = ?,
-                   remind1_at = ?, remind1_sent = ?, remind2_at = ?, remind2_sent = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (_d(due_date), _t(due_time), r1, s1, r2, s2, task_id, user_id),
-        )
-        if due_date is None:
-            # У задачи без срока повтор не имеет смысла
-            conn.execute("UPDATE tasks SET repeat = NULL WHERE id = ? AND user_id = ?", (task_id, user_id))
-
-
-def update_text(task_id: int, user_id: int, title, place, person):
-    with connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET title = ?, place = ?, person = ? WHERE id = ? AND user_id = ?",
-            (title, place, person, task_id, user_id),
-        )
-
-
-def due_reminders(now: datetime):
-    """Задачи, по которым пора отправить напоминание. Возвращает список (задача, номер)."""
-    now_s = _fmt(now)
-    result = []
-    with connect() as conn:
-        for num in (1, 2):
-            rows = conn.execute(
-                f"""
-                SELECT * FROM tasks
-                WHERE status = 'active' AND remind{num}_sent = 0 AND remind{num}_at <= ?
-                """,
-                (now_s,),
-            ).fetchall()
-            result += [(row, num) for row in rows]
-    return result
-
-
-def mark_reminded(task_id: int, num: int):
-    with connect() as conn:
-        conn.execute(f"UPDATE tasks SET remind{num}_sent = 1 WHERE id = ?", (task_id,))
-
-
-def tasks_for_period(user_id: int, start: date, end: date):
-    """Все задачи (и выполненные, и нет) со сроком в промежутке [start, end]."""
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM tasks WHERE user_id = ? AND due_date BETWEEN ? AND ?
-            ORDER BY due_date, due_time
-            """,
-            (user_id, start.isoformat(), end.isoformat()),
-        ).fetchall()
-
-
-def done_without_date(user_id: int, start: date, end: date):
-    """Задачи без срока, выполненные в промежутке [start, end]."""
-    with connect() as conn:
-        return conn.execute(
-            """
-            SELECT * FROM tasks WHERE user_id = ? AND due_date IS NULL AND status = 'done'
-              AND substr(completed_at, 1, 10) BETWEEN ? AND ?
-            """,
-            (user_id, start.isoformat(), end.isoformat()),
-        ).fetchall()

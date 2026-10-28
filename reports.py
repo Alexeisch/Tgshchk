@@ -86,17 +86,16 @@ def collect(user_id: int, period: dict, now: datetime, category_id: int = None) 
         extra = [t for t in extra if t["category_id"] == category_id]
     counts = [0, 0, 0]
     missed = []
-    buckets = [[label, 0, 0, 0] for label, _, _ in _buckets(period)]
     ranges = _buckets(period)
+    buckets = [[label, 0, 0, 0] for label, _, _ in ranges]
     for t in tasks:
         g = _group(t, now)
         counts[g] += 1
         if g == 1:
             missed.append(t)
         due = date.fromisoformat(t["due_date"])
-        for i, (_, b_start, b_end) in enumerate(ranges):
-            if b_start <= due <= b_end:
-                buckets[i][g + 1] += 1
+        i = next(i for i, (_, b_start, b_end) in enumerate(ranges) if b_start <= due <= b_end)
+        buckets[i][g + 1] += 1
     total = sum(counts)
     return {
         "counts": counts,
@@ -162,7 +161,7 @@ def render_chart(period: dict, stats: dict) -> bytes:
     for i, name in enumerate(GROUPS):
         y = 0.12 - i * 0.045
         fig.patches.append(_square(fig, 0.06, y, COLORS[i]))
-        fig.text(0.085, y, f"{name}", fontsize=9.5, color="#333333", va="center")
+        fig.text(0.085, y, name, fontsize=9.5, color="#333333", va="center")
         fig.text(0.34, y, f"{counts[i]}  ·  {stats['percents'][i]}%", fontsize=9.5,
                  color="#333333", va="center", ha="right")
 
@@ -223,10 +222,8 @@ def caption(period: dict, stats: dict, prev_stats: dict) -> str:
         text += "\n\n<b>По вкладкам</b>\n<pre>" + "\n".join(rows) + "</pre>"
 
     if stats["missed"]:
-        lines = []
-        for t in stats["missed"]:
-            label = f"{date.fromisoformat(t['due_date']).strftime('%d.%m')} — {t['title']}"
-            lines.append(html.escape(label[:60]))
+        lines = [html.escape(f"{date.fromisoformat(t['due_date']).strftime('%d.%m')} — {t['title']}"[:60])
+                 for t in stats["missed"]]
         # Показываем до 8 задач, а если подпись не влезает в лимит — меньше
         for limit in range(min(8, len(lines)), 0, -1):
             shown = lines[:limit]

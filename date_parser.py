@@ -12,33 +12,28 @@
 import re
 from datetime import date, datetime, time, timedelta
 
-MONTHS = {
-    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
-    "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
-}
-MONTH_RE = (
-    r"(января|январь|февраля|февраль|марта|март|апреля|апрель|мая|май|июня|июнь|"
-    r"июля|июль|августа|август|сентября|сентябрь|октября|октябрь|ноября|ноябрь|"
-    r"декабря|декабрь)"
-)
+MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+              "августа", "сентября", "октября", "ноября", "декабря"]
+MONTH_RE = (r"(январ[ья]|феврал[ья]|марта?|апрел[ья]|ма[яй]|июн[ья]|июл[ья]|августа?|"
+            r"сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])")
+# Номер месяца по первым трём буквам ("ноября" -> "ноя" -> 11); у мая две формы
+MONTH_NUM = {m[:3]: i for i, m in enumerate(MONTHS_GEN, 1)} | {"май": 5}
 
-WEEKDAYS = {
-    "понедельник": 0, "вторник": 1, "среду": 2, "среда": 2, "четверг": 3,
-    "пятницу": 4, "пятница": 4, "субботу": 5, "суббота": 5,
-    "воскресенье": 6,
-}
-WEEKDAY_RE = r"(?:в|во)\s+(понедельник|вторник|среду|среда|четверг|пятницу|пятница|субботу|суббота|воскресенье)"
-
-
-def _month_number(word: str) -> int:
-    word = word.lower()
-    # "мая"/"май" проверяем отдельно, чтобы не спутать с "март"
-    if word in ("мая", "май"):
-        return 5
-    for stem, num in MONTHS.items():
-        if stem != "ма" and word.startswith(stem):
-            return num
-    return 0
+# Дни недели во всех нужных формах: "в пятницу", "к пятнице", "до пятницы", "по пятницам"
+_WEEKDAY_FORMS = [
+    ("понедельник", "понедельнику", "понедельника", "понедельникам"),
+    ("вторник", "вторнику", "вторника", "вторникам"),
+    ("среду|среда", "среде", "среды", "средам"),
+    ("четверг", "четвергу", "четверга", "четвергам"),
+    ("пятницу|пятница", "пятнице", "пятницы", "пятницам"),
+    ("субботу|суббота", "субботе", "субботы", "субботам"),
+    ("воскресенье", "воскресенью", "воскресенья", "воскресеньям"),
+]
+WEEKDAY_NUM = {form: i for i, forms in enumerate(_WEEKDAY_FORMS) for group in forms for form in group.split("|")}
+_ACC = "|".join(f[0] for f in _WEEKDAY_FORMS)    # понедельник|вторник|среду|среда|...
+_DAT = "|".join(f[1] for f in _WEEKDAY_FORMS)    # понедельнику|вторнику|среде|...
+_GEN = "|".join(f[2] for f in _WEEKDAY_FORMS)    # понедельника|вторника|среды|...
+_PLURAL = "|".join(f[3] for f in _WEEKDAY_FORMS)  # понедельникам|вторникам|...
 
 
 def _safe_date(year: int, month: int, day: int):
@@ -52,133 +47,126 @@ def _add_month(d: date) -> tuple:
     return (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
 
 
+def _month_day(year: int, month: int, day: int) -> date:
+    """Дата с поправкой на короткие месяцы: 31 число в феврале -> 28 (29)."""
+    while not _safe_date(year, month, day):
+        day -= 1
+    return date(year, month, day)
+
+
 def _cut(text: str, match) -> str:
     """Вырезает найденный фрагмент из текста."""
     return text[: match.start()] + " " + text[match.end():]
 
 
+def _weekday_ahead(today: date, weekday: int, allow_today: bool) -> date:
+    """Ближайший такой день недели: начиная с сегодня (allow_today) или строго после."""
+    days = (weekday - today.weekday()) % 7
+    return today + timedelta(days=days or (0 if allow_today else 7))
+
+
+# ---------- Время ----------
+
 def extract_time(text: str):
     """Ищет время. Возвращает (time или None, текст без найденного фрагмента)."""
-    patterns = [
-        # "в 15:00", "к 9:30", "15:00", "в 15.30"
-        (r"(?:\b(?:в|к|на)\s+)?\b(\d{1,2})[:](\d{2})\b", None),
-        (r"\b(?:в|к|на)\s+(\d{1,2})\.(\d{2})\b", None),
-        # "в 8 вечера", "в 3 часа дня", "в 10 утра", "в 15 часов", "в 15ч"
-        (r"\b(?:в|к|на)\s+(\d{1,2})\s*(?:ч\b|час(?:а|ов)?\b)?\s*(утра|дня|вечера|ночи)?", "hours"),
-        (r"\bв\s+полдень\b", "noon"),
-        (r"\bв\s+полночь\b", "midnight"),
-    ]
-    for pattern, kind in patterns:
+    # "в 15:00", "к 9:30", "15:00", "в 15.30"
+    for pattern in (r"(?:\b(?:в|к|на)\s+)?\b(\d{1,2}):(\d{2})\b", r"\b(?:в|к)\s+(\d{1,2})\.(\d{2})\b"):
         for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-            if kind == "noon":
-                return time(12, 0), _cut(text, m)
-            if kind == "midnight":
-                return time(0, 0), _cut(text, m)
-            if kind == "hours":
-                # Считаем это временем, только если явно сказано "час/ч" или "утра/вечера"
-                whole = m.group(0).lower()
-                has_word = re.search(r"ч|утра|дня|вечера|ночи", whole[2:])
-                if not has_word:
-                    # "в 15" без уточнения — тоже время, если дальше не идёт название месяца/"числа"
-                    rest = text[m.end():].lstrip().lower()
-                    if re.match(MONTH_RE + r"|числа|-?го\b|\.|/", rest):
-                        continue
-                hour = int(m.group(1))
-                part = (m.group(2) or "").lower()
-                if part in ("дня", "вечера") and hour < 12:
-                    hour += 12
-                if part == "ночи" and hour == 12:
-                    hour = 0
-                if 0 <= hour <= 23:
-                    return time(hour, 0), _cut(text, m)
-                continue
             hour, minute = int(m.group(1)), int(m.group(2))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
+            if hour <= 23 and minute <= 59:
                 return time(hour, minute), _cut(text, m)
+
+    # "в 8 вечера", "в 3 часа дня", "в 10 утра", "в 15 часов", "в 15ч", "в 15"
+    # (только с "в"/"к": "на 3 дня" — это не время)
+    for m in re.finditer(r"\b(?:в|к)\s+(\d{1,2})(?!\d)\s*(ч\b|час(?:а|ов)?\b)?\s*(утра|дня|вечера|ночи)?",
+                         text, flags=re.IGNORECASE):
+        if not (m.group(2) or m.group(3)):
+            # "в 15" без уточнения — время, только если дальше не идёт месяц/"числа" ("в 15 ноября")
+            rest = text[m.end():].lstrip().lower()
+            if re.match(MONTH_RE + r"|числа|-?го\b|\.|/", rest):
+                continue
+        hour = int(m.group(1))
+        part = (m.group(3) or "").lower()
+        if part in ("дня", "вечера") and hour < 12:
+            hour += 12
+        elif part == "ночи" and hour == 12:
+            hour = 0
+        if hour <= 23:
+            return time(hour, 0), _cut(text, m)
+
+    for pattern, value in ((r"\bв\s+полдень\b", time(12, 0)), (r"\bв\s+полночь\b", time(0, 0))):
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return value, _cut(text, m)
     return None, text
+
+
+# ---------- Дата ----------
+
+# Относительные даты: (шаблон, функция(найденное, сегодня) -> дата)
+_RELATIVE = [
+    (r"послезавтра", lambda m, t: t + timedelta(days=2)),
+    (r"завтра", lambda m, t: t + timedelta(days=1)),
+    (r"сегодня", lambda m, t: t),
+    (r"через\s+(\d+)\s+(?:день|дня|дней)", lambda m, t: t + timedelta(days=int(m.group(1)))),
+    (r"через\s+(\d+)\s+(?:неделю|недели|недель)", lambda m, t: t + timedelta(weeks=int(m.group(1)))),
+    (r"через\s+неделю", lambda m, t: t + timedelta(weeks=1)),
+    (r"через\s+месяц", lambda m, t: _month_day(*_add_month(t), t.day)),
+]
+
+
+def _day_month(today: date, day: int, month: int, year):
+    """Дата из числа и месяца. Если год не указан и дата уже прошла — берём следующий год."""
+    d = _safe_date(year or today.year, month, day)
+    if d and not year and d < today:
+        d = _safe_date(today.year + 1, month, day) or d
+    return d
 
 
 def extract_date(text: str, today: date):
     """Ищет дату. Возвращает (date или None, текст без найденного фрагмента)."""
     low = text.lower()
 
-    m = re.search(r"\bпослезавтра\b", low)
-    if m:
-        return today + timedelta(days=2), _cut(text, m)
-    m = re.search(r"\bзавтра\b", low)
-    if m:
-        return today + timedelta(days=1), _cut(text, m)
-    m = re.search(r"\bсегодня\b", low)
-    if m:
-        return today, _cut(text, m)
-
-    # "через 3 дня", "через неделю", "через месяц"
-    m = re.search(r"\bчерез\s+(\d+)\s+(день|дня|дней)\b", low)
-    if m:
-        return today + timedelta(days=int(m.group(1))), _cut(text, m)
-    m = re.search(r"\bчерез\s+(\d+)\s+(неделю|недели|недель)\b", low)
-    if m:
-        return today + timedelta(weeks=int(m.group(1))), _cut(text, m)
-    m = re.search(r"\bчерез\s+неделю\b", low)
-    if m:
-        return today + timedelta(weeks=1), _cut(text, m)
-    m = re.search(r"\bчерез\s+месяц\b", low)
-    if m:
-        y, mo = _add_month(today)
-        d = _safe_date(y, mo, today.day) or _safe_date(y, mo, 28)
-        return d, _cut(text, m)
+    for pattern, make in _RELATIVE:
+        m = re.search(rf"\b{pattern}\b", low)
+        if m:
+            return make(m, today), _cut(text, m)
 
     # "06.11.2026", "6.11", "6/11"
     m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", low)
     if m:
-        day, month = int(m.group(1)), int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else today.year
-        if year < 100:
-            year += 2000
-        d = _safe_date(year, month, day)
+        year = int(m.group(3)) if m.group(3) else None
+        d = _day_month(today, int(m.group(1)), int(m.group(2)), year + 2000 if year and year < 100 else year)
         if d:
-            if not m.group(3) and d < today:
-                d = _safe_date(year + 1, month, day) or d
             return d, _cut(text, m)
 
     # "6 ноября", "6-го ноября 2027"
     m = re.search(r"\b(\d{1,2})(?:-?го|-?е)?\s+" + MONTH_RE + r"(?:\s+(\d{4}))?(?:\s*года?)?", low)
     if m:
-        day, month = int(m.group(1)), _month_number(m.group(2))
-        year = int(m.group(3)) if m.group(3) else today.year
-        d = _safe_date(year, month, day)
+        d = _day_month(today, int(m.group(1)), MONTH_NUM[m.group(2)[:3]], int(m.group(3)) if m.group(3) else None)
         if d:
-            if not m.group(3) and d < today:
-                d = _safe_date(year + 1, month, day) or d
             return d, _cut(text, m)
 
     # "6 числа", "6-го числа" (+ необязательно "этого/следующего месяца")
-    m = re.search(
-        r"\b(\d{1,2})(?:-?го|-?е)?\s+числа(?:\s+(этого|текущего|следующего)\s+месяца)?", low
-    )
+    m = re.search(r"\b(\d{1,2})(?:-?го|-?е)?\s+числа(?:\s+(этого|текущего|следующего)\s+месяца)?", low)
     if m:
-        day = int(m.group(1))
-        which = m.group(2)
-        if which == "следующего":
-            y, mo = _add_month(today)
-            d = _safe_date(y, mo, day)
-        else:
-            d = _safe_date(today.year, today.month, day)
-            if d is None or (d < today and which is None):
-                y, mo = _add_month(today)
-                d = _safe_date(y, mo, day)
+        day, which = int(m.group(1)), m.group(2)
+        d = None if which == "следующего" else _safe_date(today.year, today.month, day)
+        if d is None or (d < today and which is None):
+            d = _safe_date(*_add_month(today), day)
         if d:
             return d, _cut(text, m)
 
-    # "в пятницу", "во вторник" — ближайший такой день впереди
-    m = re.search(WEEKDAY_RE, low)
+    # "в пятницу", "во вторник", "к пятнице", "до понедельника" — ближайший такой день впереди
+    m = re.search(rf"\b(?:(?:в|во)\s+({_ACC})|(?:к|ко)\s+({_DAT})|до\s+({_GEN}))\b", low)
     if m:
-        target = WEEKDAYS[m.group(1)]
-        days_ahead = (target - today.weekday()) % 7 or 7
-        return today + timedelta(days=days_ahead), _cut(text, m)
+        weekday = WEEKDAY_NUM[next(g for g in m.groups() if g)]
+        return _weekday_ahead(today, weekday, allow_today=False), _cut(text, m)
 
     return None, text
 
+
+# ---------- Место и человек ----------
 
 def extract_place(text: str):
     m = re.search(
@@ -202,12 +190,10 @@ def extract_person(text: str):
 
 
 def _clean_title(text: str) -> str:
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
     text = re.sub(r"(^|\s)(у\s+меня|запланирована?|запланировано|запланированы)(?=\s|$)", " ", text,
                   flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip(" ,.;:-—")
-    return text[:1].upper() + text[1:] if text else text
+    text = re.sub(r"\s+([,.!?;:])", r"\1", re.sub(r"\s+", " ", text)).strip(" ,.;:-—")
+    return text[:1].upper() + text[1:]
 
 
 # ---------- Повторяющиеся задачи ----------
@@ -229,30 +215,22 @@ REPEAT_KINDS = {
 
 WEEKDAY_EVERY = ["каждый понедельник", "каждый вторник", "каждую среду", "каждый четверг",
                  "каждую пятницу", "каждую субботу", "каждое воскресенье"]
-MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
-              "августа", "сентября", "октября", "ноября", "декабря"]
 
 
 def make_repeat(kind: str, start: date):
     """Превращает вид повтора ("weekly") и дату первого раза в правило ("weekly:2")."""
-    if kind == "weekly":
-        return f"weekly:{start.weekday()}"
-    if kind == "monthly":
-        return f"monthly:{start.day}"
-    if kind == "yearly":
-        return f"yearly:{start.month:02d}-{start.day:02d}"
-    return kind if kind in ("daily", "weekdays") else None
+    return {
+        "daily": "daily",
+        "weekdays": "weekdays",
+        "weekly": f"weekly:{start.weekday()}",
+        "monthly": f"monthly:{start.day}",
+        "yearly": f"yearly:{start.month:02d}-{start.day:02d}",
+    }.get(kind)
 
 
 def repeat_label(repeat) -> str:
     """Человекочитаемое описание правила: "каждую среду", "каждый месяц, 5 числа"."""
-    if not repeat:
-        return ""
-    kind, _, arg = repeat.partition(":")
-    if kind == "daily":
-        return "каждый день"
-    if kind == "weekdays":
-        return "по будням"
+    kind, _, arg = (repeat or "").partition(":")
     if kind == "weekly":
         return WEEKDAY_EVERY[int(arg)]
     if kind == "monthly":
@@ -260,16 +238,7 @@ def repeat_label(repeat) -> str:
     if kind == "yearly":
         month, day = (int(x) for x in arg.split("-"))
         return f"каждый год, {day} {MONTHS_GEN[month - 1]}"
-    return ""
-
-
-def _month_day(year: int, month: int, day: int) -> date:
-    """Дата с поправкой на короткие месяцы: 31 число в феврале -> 28 (29)."""
-    while True:
-        d = _safe_date(year, month, day)
-        if d:
-            return d
-        day -= 1
+    return {"daily": "каждый день", "weekdays": "по будням"}.get(kind, "")
 
 
 def next_date(repeat: str, after: date) -> date:
@@ -278,18 +247,12 @@ def next_date(repeat: str, after: date) -> date:
     if kind == "daily":
         return after + timedelta(days=1)
     if kind == "weekdays":
-        d = after + timedelta(days=1)
-        while d.weekday() >= 5:
-            d += timedelta(days=1)
-        return d
+        return after + timedelta(days={4: 3, 5: 2}.get(after.weekday(), 1))  # пт и сб -> понедельник
     if kind == "weekly":
         return after + timedelta(days=(int(arg) - after.weekday() - 1) % 7 + 1)
     if kind == "monthly":
         d = _month_day(after.year, after.month, int(arg))
-        if d <= after:
-            y, m = _add_month(after)
-            d = _month_day(y, m, int(arg))
-        return d
+        return d if d > after else _month_day(*_add_month(after), int(arg))
     if kind == "yearly":
         month, day = (int(x) for x in arg.split("-"))
         d = _month_day(after.year, month, day)
@@ -310,55 +273,50 @@ def first_occurrence(repeat: str, today: date) -> date:
     return next_date(repeat, today - timedelta(days=1))
 
 
+_SIMPLE_REPEATS = [
+    (r"каждый\s+день|ежедневно", "daily"),
+    (r"по\s+будням|каждый\s+будний\s+день|в\s+будни", "weekdays"),
+    (r"каждую\s+неделю|еженедельно", "weekly"),
+    (r"каждый\s+месяц|ежемесячно", "monthly"),
+    (r"каждый\s+год|ежегодно", "yearly"),
+]
+
+
 def extract_repeat(text: str, today: date):
     """
     Ищет слова о повторе: "каждый день", "по будням", "каждую среду", "каждое 5 число",
     "ежемесячно" и т.п. Возвращает (вид повтора, подсказка даты или None, текст без фрагмента).
     """
     low = text.lower()
-    simple = [
-        (r"\b(?:каждый\s+день|ежедневно)\b", "daily"),
-        (r"\b(?:по\s+будням|каждый\s+будний\s+день|в\s+будни)\b", "weekdays"),
-        (r"\b(?:каждую\s+неделю|еженедельно)\b", "weekly"),
-        (r"\b(?:каждый\s+месяц|ежемесячно)\b", "monthly"),
-        (r"\b(?:каждый\s+год|ежегодно)\b", "yearly"),
-    ]
-    for pattern, kind in simple:
-        m = re.search(pattern, low)
+    for pattern, kind in _SIMPLE_REPEATS:
+        m = re.search(rf"\b(?:{pattern})\b", low)
         if m:
             return kind, None, _cut(text, m)
 
     # "каждый понедельник", "каждую среду", "по пятницам"
-    m = re.search(r"\b(?:каждый|каждую|каждое)\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)\b", low)
+    m = re.search(rf"\b(?:(?:каждый|каждую|каждое)\s+({_ACC})|по\s+({_PLURAL}))\b", low)
     if m:
-        target = WEEKDAYS[m.group(1)]
-        return "weekly", today + timedelta(days=(target - today.weekday()) % 7), _cut(text, m)
-    plural = {"понедельникам": 0, "вторникам": 1, "средам": 2, "четвергам": 3,
-              "пятницам": 4, "субботам": 5, "воскресеньям": 6}
-    m = re.search(r"\bпо\s+(" + "|".join(plural) + r")\b", low)
-    if m:
-        target = plural[m.group(1)]
-        return "weekly", today + timedelta(days=(target - today.weekday()) % 7), _cut(text, m)
+        start = _weekday_ahead(today, WEEKDAY_NUM[m.group(1) or m.group(2)], allow_today=True)
+        return "weekly", start, _cut(text, m)
 
     # "каждое 5 число", "каждого 5-го числа"
     m = re.search(r"\b(?:каждое|каждого)\s+(\d{1,2})(?:-?го|-?е)?\s+числ[оа]\b", low)
     if m and 1 <= int(m.group(1)) <= 31:
         day = int(m.group(1))
         hint = _month_day(today.year, today.month, day)
-        if hint < today:
-            y, mo = _add_month(today)
-            hint = _month_day(y, mo, day)
-        return "monthly", hint, _cut(text, m)
+        return "monthly", hint if hint >= today else _month_day(*_add_month(today), day), _cut(text, m)
 
     return None, None, text
 
 
-def parse_task(text: str, now: datetime) -> dict:
-    """Главная функция: разбирает сообщение пользователя на части."""
-    original = text.strip()
-    rest = original
+# ---------- Главная функция ----------
 
-    due_time, rest = extract_time(rest)
+def parse_task(text: str, now: datetime) -> dict:
+    """Разбирает сообщение пользователя на части."""
+    original = text.strip()
+    naive_now = now.replace(tzinfo=None)
+
+    due_time, rest = extract_time(original)
     repeat_kind, repeat_hint, rest = extract_repeat(rest, now.date())
     due_date, rest = extract_date(rest, now.date())
     place, rest = extract_place(rest)
@@ -375,19 +333,17 @@ def parse_task(text: str, now: datetime) -> dict:
             )
         repeat = make_repeat(repeat_kind, due_date)
         # Если дата не названа явно, а время сегодня уже прошло — первый раз будет в следующий подходящий день
-        if (not explicit_date and due_time
-                and datetime.combine(due_date, due_time) <= now.replace(tzinfo=None)):
+        if not explicit_date and due_time and datetime.combine(due_date, due_time) <= naive_now:
             due_date = next_date(repeat, due_date)
 
     # Если указано только время — считаем, что это сегодня (или завтра, если время уже прошло)
     if due_time and not due_date:
         due_date = now.date()
-        if datetime.combine(due_date, due_time) <= now.replace(tzinfo=None):
+        if datetime.combine(due_date, due_time) <= naive_now:
             due_date += timedelta(days=1)
 
-    title = _clean_title(rest) or original
     return {
-        "title": title,
+        "title": _clean_title(rest) or original,
         "due_date": due_date,
         "due_time": due_time,
         "place": place,
@@ -399,5 +355,5 @@ def parse_task(text: str, now: datetime) -> dict:
 def parse_when(text: str, now: datetime):
     """Разбирает только дату/время (используется при переносе задачи)."""
     due_time, rest = extract_time(text)
-    due_date, rest = extract_date(rest, now.date())
+    due_date, _ = extract_date(rest, now.date())
     return due_date, due_time

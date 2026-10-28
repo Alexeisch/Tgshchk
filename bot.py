@@ -28,6 +28,7 @@ from telegram.ext import (
 import database as db
 import reports
 import weather
+from date_parser import MONTHS_GEN as MONTH_NAMES
 from date_parser import (REPEAT_KINDS, first_occurrence, make_repeat, next_date, next_occurrence,
                          parse_task, parse_when, repeat_label)
 
@@ -44,8 +45,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 WEEKDAY_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-MONTH_NAMES = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
-               "августа", "сентября", "октября", "ноября", "декабря"]
 
 # Состояния: чего бот ждёт от пользователя следующим сообщением
 WAIT_NEW_TASK = "wait_new_task"
@@ -61,6 +60,14 @@ WAIT_TAB_RENAME = "wait_tab_rename"
 
 def now() -> datetime:
     return datetime.now(TZ)
+
+
+def task_date(task):
+    return date.fromisoformat(task["due_date"]) if task["due_date"] else None
+
+
+def task_time(task):
+    return time.fromisoformat(task["due_time"]) if task["due_time"] else None
 
 
 # ---------- Форматирование ----------
@@ -90,11 +97,9 @@ def fmt_time(t) -> str:
 def is_overdue(task) -> bool:
     if not task["due_date"] or task["status"] != "active":
         return False
-    n = now()
     if task["due_time"]:
-        due = datetime.fromisoformat(f"{task['due_date']} {task['due_time']}")
-        return due < n.replace(tzinfo=None)
-    return date.fromisoformat(task["due_date"]) < n.date()
+        return datetime.combine(task_date(task), task_time(task)) < now().replace(tzinfo=None)
+    return task_date(task) < now().date()
 
 
 def header(title: str, subtitle: str = "") -> str:
@@ -150,8 +155,7 @@ def short_label(task, tab: str = None) -> str:
     if is_overdue(task):
         parts.append("!")
     if task["due_date"]:
-        d = date.fromisoformat(task["due_date"])
-        parts.append(d.strftime("%d.%m"))
+        parts.append(task_date(task).strftime("%d.%m"))
     if task["due_time"]:
         parts.append(task["due_time"])
     if task["repeat"]:
@@ -241,8 +245,10 @@ async def reply_or_edit(update: Update, text: str, markup=None):
                 text, reply_markup=markup, parse_mode=ParseMode.HTML
             )
             return
-        except Exception:
-            pass  # например, сообщение слишком старое — тогда просто отправим новое
+        except Exception as exc:
+            if "not modified" in str(exc):
+                return  # нажали ту же кнопку ещё раз — на экране и так всё актуально
+            # иначе (например, сообщение слишком старое) просто отправим новое
     await update.effective_chat.send_message(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
 
@@ -286,6 +292,22 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
+async def load_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
+    """Задача пользователя. Если её нет (например, удалили) — показывает главное меню и возвращает None."""
+    task = db.get_task(task_id, update.effective_user.id)
+    if not task:
+        await show_menu(update, context)
+    return task
+
+
+async def load_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создаваемая задача. Если её уже нет (бот перезапускали) — показывает главное меню и возвращает None."""
+    draft = context.user_data.get("draft")
+    if not draft:
+        await show_menu(update, context)
+    return draft
+
+
 # ---------- Создание задачи ----------
 
 async def ask_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE, category_id: int = None):
@@ -319,10 +341,9 @@ async def show_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply_or_edit(update, text, draft_keyboard())
 
 
-async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = context.user_data.get("draft")
+async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, _=None):
+    d = await load_draft(update, context)
     if not d:
-        await show_menu(update, context)
         return
     db.add_task(update.effective_user.id, d["title"], d["place"], d["person"],
                 d["due_date"], d["due_time"], now(), d.get("repeat"), d.get("category_id"))
@@ -340,6 +361,46 @@ async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
              ("≡  К списку", f"list:all:{d.get('category_id') or 0}")],
             [("⌂  Главное меню", "menu")]]),
     )
+
+
+async def ask_draft_when(update: Update, context: ContextTypes.DEFAULT_TYPE, _=None):
+    if not await load_draft(update, context):
+        return
+    context.user_data["state"] = WAIT_DRAFT_WHEN
+    await reply_or_edit(
+        update,
+        header("Дата и время") + "\n\nНапишите дату и время, например:\n"
+        "<code>завтра в 18:00</code>, <code>6 ноября</code>, <code>12.11 в 9:30</code>",
+        kb([[("Сегодня", "draft_day:0"), ("Завтра", "draft_day:1")],
+            [("Без срока", "draft_day:none")],
+            [("←  Назад", "draft_back")]]),
+    )
+
+
+async def set_draft_day(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str):
+    """Кнопки «Сегодня» / «Завтра» / «Без срока» для создаваемой задачи."""
+    d = await load_draft(update, context)
+    if not d:
+        return
+    if arg == "none":
+        d["due_date"], d["due_time"], d["repeat"] = None, None, None
+    else:
+        d["due_date"] = now().date() + timedelta(days=int(arg))
+        refresh_draft_repeat(d)
+    context.user_data["state"] = None
+    await show_draft(update, context)
+
+
+async def draft_back(update: Update, context: ContextTypes.DEFAULT_TYPE, _=None):
+    if await load_draft(update, context):
+        context.user_data["state"] = None
+        await show_draft(update, context)
+
+
+def refresh_draft_repeat(draft: dict):
+    """После смены даты пересчитываем правило повтора (например, "каждую среду" -> "каждую пятницу")."""
+    if draft.get("repeat") and draft["due_date"]:
+        draft["repeat"] = make_repeat(draft["repeat"].partition(":")[0], draft["due_date"])
 
 
 # ---------- Списки задач ----------
@@ -365,6 +426,16 @@ def filter_tasks(tasks, period: str):
         if d <= end:  # просроченные тоже показываем, чтобы о них не забыть
             result.append(t)
     return result
+
+
+async def open_list(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str):
+    """Кнопка списка: "all:3" (период:вкладка) или "back" — вернуться в последний открытый список."""
+    if arg == "back":
+        period, cat = context.chat_data.get("last_list", ("all", 0))
+    else:
+        period, _, cat = arg.partition(":")
+        period, cat = period or "all", int(cat or 0)
+    await show_list(update, context, period, cat)
 
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str = "all", cat: int = 0):
@@ -428,10 +499,21 @@ async def show_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
 
 # ---------- Действия с задачей ----------
 
+async def restore_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
+    """«Вернуть в текущие» для выполненной задачи."""
+    db.set_active(task_id, update.effective_user.id)
+    await show_task(update, context, task_id)
+
+
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
+    db.delete_task(task_id, update.effective_user.id)
+    await reply_or_edit(update, header("Задача удалена"),
+                        kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
+
+
 async def ask_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    task = db.get_task(task_id, update.effective_user.id)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     context.user_data.clear()
     context.user_data["state"] = WAIT_RESCHEDULE
@@ -448,16 +530,13 @@ async def ask_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE, tas
 
 async def shift_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int, how: str):
     uid = update.effective_user.id
-    task = db.get_task(task_id, uid)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     n = now()
-    d = date.fromisoformat(task["due_date"]) if task["due_date"] else n.date()
-    t = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-    # Если задача просрочена, переносим относительно сегодняшнего дня
-    if d < n.date():
-        d = n.date()
+    # Если задача просрочена или без срока, переносим относительно сегодняшнего дня
+    d = max(task_date(task) or n.date(), n.date())
+    t = task_time(task)
     if how == "none":
         d, t = None, None
     elif how == "h1":
@@ -469,14 +548,13 @@ async def shift_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
     elif how == "w1":
         d += timedelta(weeks=1)
     db.update_when(task_id, uid, d, t, n)
-    await reply_or_edit(update, header("Задача перенесена") + "\n\n" + card_from_row(db.get_task(task_id, uid)),
-                        task_keyboard(db.get_task(task_id, uid)))
+    task = db.get_task(task_id, uid)
+    await reply_or_edit(update, header("Задача перенесена") + "\n\n" + card_from_row(task), task_keyboard(task))
 
 
 async def ask_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    task = db.get_task(task_id, update.effective_user.id)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     context.user_data.clear()
     context.user_data["state"] = WAIT_EDIT_TEXT
@@ -503,10 +581,9 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
     if task["repeat"] and task["due_date"]:
         # Повторяющаяся задача: создаём следующий раз, а у выполненной копии повтор убираем
         nxt = next_run(task, n)
-        due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-        db.add_task(uid, task["title"], task["place"], task["person"], nxt, due_time, n, task["repeat"],
+        db.add_task(uid, task["title"], task["place"], task["person"], nxt, task_time(task), n, task["repeat"],
                     task["category_id"])
-        db.set_repeat(task_id, uid, None)
+        db.update_task(task_id, uid, repeat=None)
         when = fmt_date(nxt) + (f" · {task['due_time']}" if task["due_time"] else "")
         note = f"\n<i>Следующий раз — {when}</i>"
     await reply_or_edit(update, header("Задача выполнена") + "\n\n" + card_from_row(db.get_task(task_id, uid))
@@ -516,8 +593,8 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
 
 def next_run(task, n: datetime):
     """Дата следующего раза повторяющейся задачи — всегда в будущем."""
-    nxt = next_occurrence(task["repeat"], date.fromisoformat(task["due_date"]), n.date())
-    if task["due_time"] and datetime.combine(nxt, time.fromisoformat(task["due_time"])) <= n.replace(tzinfo=None):
+    nxt = next_occurrence(task["repeat"], task_date(task), n.date())
+    if task["due_time"] and datetime.combine(nxt, task_time(task)) <= n.replace(tzinfo=None):
         nxt = next_date(task["repeat"], nxt)  # сегодняшнее время уже прошло
     return nxt
 
@@ -525,14 +602,11 @@ def next_run(task, n: datetime):
 async def skip_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
     """Пропустить этот раз повторяющейся задачи: переносим на следующую дату по правилу."""
     uid = update.effective_user.id
-    task = db.get_task(task_id, uid)
+    task = await load_task(update, context, task_id)
     if not task or not task["repeat"] or not task["due_date"]:
-        await show_menu(update, context)
         return
     n = now()
-    nxt = next_run(task, n)
-    due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-    db.update_when(task_id, uid, nxt, due_time, n)
+    db.update_when(task_id, uid, next_run(task, n), task_time(task), n)
     task = db.get_task(task_id, uid)
     await reply_or_edit(update, header("Пропущено", "Задача перенесена на следующий раз") + "\n\n"
                         + card_from_row(task), task_keyboard(task))
@@ -541,16 +615,14 @@ async def skip_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
 async def show_repeat_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
     """Выбор повтора. target = "d" (создаваемая задача) или номер задачи."""
     if target == "d":
-        d = context.user_data.get("draft")
+        d = await load_draft(update, context)
         if not d:
-            await show_menu(update, context)
             return
         current, back = d.get("repeat"), "draft_back"
         context.user_data["state"] = None
     else:
-        task = db.get_task(int(target), update.effective_user.id)
+        task = await load_task(update, context, int(target))
         if not task:
-            await show_menu(update, context)
             return
         current, back = task["repeat"], f"task:{target}"
     text = header("Повтор", f"Сейчас: {repeat_label(current) or 'не повторяется'}") + "\n\n" + \
@@ -577,9 +649,8 @@ def start_date_for(kind: str, current: date | None) -> date:
 
 async def set_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str, kind: str):
     if target == "d":
-        d = context.user_data.get("draft")
+        d = await load_draft(update, context)
         if not d:
-            await show_menu(update, context)
             return
         if kind == "none":
             d["repeat"] = None
@@ -591,29 +662,25 @@ async def set_repeat_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     uid = update.effective_user.id
     task_id = int(target)
-    task = db.get_task(task_id, uid)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     if kind == "none":
-        db.set_repeat(task_id, uid, None)
+        db.update_task(task_id, uid, repeat=None)
         title = "Повтор отключён"
     else:
-        old = date.fromisoformat(task["due_date"]) if task["due_date"] else None
-        start = start_date_for(kind, old)
-        if start != old:
-            due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-            db.update_when(task_id, uid, start, due_time, now())
-        db.set_repeat(task_id, uid, make_repeat(kind, start))
+        start = start_date_for(kind, task_date(task))
+        if start != task_date(task):
+            db.update_when(task_id, uid, start, task_time(task), now())
+        db.update_task(task_id, uid, repeat=make_repeat(kind, start))
         title = "Повтор настроен"
     task = db.get_task(task_id, uid)
     await reply_or_edit(update, header(title) + "\n\n" + card_from_row(task), task_keyboard(task))
 
 
 async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    task = db.get_task(task_id, update.effective_user.id)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     note = "\n<i>Повтор тоже будет остановлен.</i>" if task["repeat"] else ""
     await reply_or_edit(update, header("Удалить задачу?") + "\n\n" + card_from_row(task) + note,
@@ -694,16 +761,14 @@ async def show_tab_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
     """Выбор вкладки для задачи. target = "d" (создаваемая задача) или номер задачи."""
     uid = update.effective_user.id
     if target == "d":
-        d = context.user_data.get("draft")
+        d = await load_draft(update, context)
         if not d:
-            await show_menu(update, context)
             return
         current, back, prefix = d.get("category_id"), "draft_back", "dtabset:"
         context.user_data["state"] = None
     else:
-        task = db.get_task(int(target), uid)
+        task = await load_task(update, context, int(target))
         if not task:
-            await show_menu(update, context)
             return
         current, back, prefix = task["category_id"], f"task:{target}", f"moveto:{target}:"
     tabs = db.get_categories(uid)
@@ -716,14 +781,20 @@ async def show_tab_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
     await reply_or_edit(update, text, kb(rows))
 
 
+async def set_draft_tab(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int):
+    d = await load_draft(update, context)
+    if d:
+        d["category_id"] = cat if cat and db.get_category(cat, update.effective_user.id) else None
+        await show_draft(update, context)
+
+
 async def move_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int, cat: int):
     uid = update.effective_user.id
     if cat and not db.get_category(cat, uid):
         cat = 0
-    db.set_category(task_id, uid, cat or None)
-    task = db.get_task(task_id, uid)
+    db.update_task(task_id, uid, category_id=cat or None)
+    task = await load_task(update, context, task_id)
     if not task:
-        await show_menu(update, context)
         return
     await reply_or_edit(update, header("Вкладка изменена") + "\n\n" + card_from_row(task), task_keyboard(task))
 
@@ -801,6 +872,15 @@ async def save_city(update: Update, context: ContextTypes.DEFAULT_TYPE, city: di
     await show_weather_settings(update, context, note)
 
 
+async def pick_city(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int):
+    """Нажали на один из найденных городов с одинаковым названием."""
+    cities = context.user_data.get("cities") or []
+    if index < len(cities):
+        await save_city(update, context, cities[index])
+    else:
+        await ask_city(update, context)
+
+
 async def ask_weather_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["state"] = WAIT_WEATHER_TIME
@@ -844,14 +924,6 @@ async def send_weather_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Погода недоступна: %s", exc)
         text = "Не удалось получить прогноз. Попробуйте позже."
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=BACK_TO_MENU)
-
-
-async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /weather — погода на сегодня прямо сейчас."""
-    if not allowed(update):
-        return
-    db.save_user(update.effective_user.id, update.effective_user.first_name or "")
-    await send_weather_now(update, context)
 
 
 # ---------- Настройки: отчёты ----------
@@ -968,18 +1040,13 @@ async def show_report_tab_picker(update: Update, context: ContextTypes.DEFAULT_T
     await reply_or_edit(update, text, kb(rows))
 
 
-async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /summary — отчёт за текущую неделю прямо сейчас."""
-    if allowed(update):
-        db.save_user(update.effective_user.id, update.effective_user.first_name or "")
-        await report_now(update, context, "week")
-
-
-async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /month — отчёт за текущий месяц прямо сейчас."""
-    if allowed(update):
-        db.save_user(update.effective_user.id, update.effective_user.first_name or "")
-        await report_now(update, context, "month")
+def command(handler):
+    """Обёртка для команд вроде /summary: проверка доступа и запоминание пользователя."""
+    async def run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if allowed(update):
+            db.save_user(update.effective_user.id, update.effective_user.first_name or "")
+            await handler(update, context)
+    return run
 
 
 def parse_hhmm(text: str):
@@ -992,159 +1059,78 @@ def parse_hhmm(text: str):
 
 # ---------- Обработка нажатий на кнопки ----------
 
+def _two(arg: str):
+    """ "5:w1" -> ("5", "w1") """
+    first, _, second = arg.partition(":")
+    return first, second
+
+
+# Кнопка — это строка "действие:параметры"; здесь для каждого действия указано, что делать.
+# Каждая функция получает (update, context, параметры-строкой).
+BUTTONS = {
+    "menu": lambda u, c, a: show_menu(u, c),
+    "new": lambda u, c, a: ask_new_task(u, c),
+    "newin": lambda u, c, a: ask_new_task(u, c, int(a) or None),
+    "list": open_list,
+    "done_list": lambda u, c, a: show_done_list(u, c),
+    # Создаваемая задача
+    "draft_save": save_draft,
+    "draft_when": ask_draft_when,
+    "draft_day": set_draft_day,
+    "draft_back": draft_back,
+    "dtab": lambda u, c, a: show_tab_picker(u, c, "d"),
+    "dtabset": lambda u, c, a: set_draft_tab(u, c, int(a)),
+    # Задача
+    "task": lambda u, c, a: show_task(u, c, int(a)),
+    "undone": lambda u, c, a: restore_task(u, c, int(a)),
+    "resched": lambda u, c, a: ask_reschedule(u, c, int(a)),
+    "shift": lambda u, c, a: shift_task(u, c, int(_two(a)[0]), _two(a)[1]),
+    "edit": lambda u, c, a: ask_edit(u, c, int(a)),
+    "del": lambda u, c, a: ask_delete(u, c, int(a)),
+    "delyes": lambda u, c, a: confirm_delete(u, c, int(a)),
+    "skip": lambda u, c, a: skip_task(u, c, int(a)),
+    "repmenu": lambda u, c, a: show_repeat_menu(u, c, a),
+    "repset": lambda u, c, a: set_repeat_choice(u, c, *_two(a)),
+    "move": lambda u, c, a: show_tab_picker(u, c, a),
+    "moveto": lambda u, c, a: move_task(u, c, *map(int, _two(a))),
+    # Вкладки
+    "tabnew": lambda u, c, a: ask_tab_name(u, c),
+    "tabopt": lambda u, c, a: show_tab_options(u, c, int(a)),
+    "tabren": lambda u, c, a: ask_tab_name(u, c, rename_id=int(a)),
+    "tabdel": lambda u, c, a: ask_tab_delete(u, c, int(a)),
+    "tabdelyes": lambda u, c, a: delete_tab(u, c, int(_two(a)[0]), _two(a)[1]),
+    # Настройки: погода
+    "settings": lambda u, c, a: show_settings(u, c),
+    "w_settings": lambda u, c, a: show_weather_settings(u, c),
+    "w_city": lambda u, c, a: ask_city(u, c),
+    "w_citypick": lambda u, c, a: pick_city(u, c, int(a)),
+    "w_time": lambda u, c, a: ask_weather_time(u, c),
+    "w_settime": lambda u, c, a: set_weather_time(u, c, a),
+    "w_toggle": lambda u, c, a: toggle_weather(u, c),
+    "w_now": lambda u, c, a: send_weather_now(u, c),
+    # Настройки: отчёты
+    "r_settings": lambda u, c, a: show_report_settings(u, c),
+    "r_time": lambda u, c, a: ask_report_time(u, c, a),
+    "r_settime": lambda u, c, a: set_report_time(u, c, *_two(a)),
+    "r_toggle": lambda u, c, a: toggle_report(u, c, a),
+    "r_now": lambda u, c, a: report_now(u, c, _two(a)[0], int(_two(a)[1]) if _two(a)[1] else None),
+    "r_tabs": lambda u, c, a: show_report_tab_picker(u, c),
+}
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
     if not allowed(update):
         await answer_query(update, "Доступ ограничен")
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
-    data = query.data
-    action, _, arg = data.partition(":")
-
+    action, _, arg = update.callback_query.data.partition(":")
     if action == "done":
-        await mark_done(update, context, int(arg))
-        return  # mark_done сам отвечает на нажатие
+        await mark_done(update, context, int(arg))  # сам отвечает на нажатие (всплывающая подсказка)
+        return
     await answer_query(update)
-
-    if action == "menu":
-        await show_menu(update, context)
-    elif action == "settings":
-        await show_settings(update, context)
-    elif action == "w_settings":
-        await show_weather_settings(update, context)
-    elif action == "w_city":
-        await ask_city(update, context)
-    elif action == "w_citypick":
-        cities = context.user_data.get("cities") or []
-        if int(arg) < len(cities):
-            await save_city(update, context, cities[int(arg)])
-        else:
-            await ask_city(update, context)
-    elif action == "w_time":
-        await ask_weather_time(update, context)
-    elif action == "w_settime":
-        await set_weather_time(update, context, arg)
-    elif action == "w_toggle":
-        await toggle_weather(update, context)
-    elif action == "w_now":
-        await send_weather_now(update, context)
-    elif action == "r_settings":
-        await show_report_settings(update, context)
-    elif action == "r_time":
-        await ask_report_time(update, context, arg)
-    elif action == "r_settime":
-        kind, r_time = arg.split(":", 1)
-        await set_report_time(update, context, kind, r_time)
-    elif action == "r_toggle":
-        await toggle_report(update, context, arg)
-    elif action == "r_now":
-        kind, _, cat = arg.partition(":")
-        await report_now(update, context, kind, int(cat) if cat else None)
-    elif action == "r_tabs":
-        await show_report_tab_picker(update, context)
-    elif action == "new":
-        await ask_new_task(update, context)
-    elif action == "newin":
-        await ask_new_task(update, context, int(arg) or None)
-    elif action == "list":
-        if arg == "back":
-            period, cat = context.chat_data.get("last_list", ("all", 0))
-        else:
-            period, _, cat = arg.partition(":")
-            period, cat = period or "all", int(cat or 0)
-        await show_list(update, context, period, cat)
-    elif action == "tabnew":
-        await ask_tab_name(update, context)
-    elif action == "tabopt":
-        await show_tab_options(update, context, int(arg))
-    elif action == "tabren":
-        await ask_tab_name(update, context, rename_id=int(arg))
-    elif action == "tabdel":
-        await ask_tab_delete(update, context, int(arg))
-    elif action == "tabdelyes":
-        cat, mode = arg.split(":")
-        await delete_tab(update, context, int(cat), mode)
-    elif action == "move":
-        await show_tab_picker(update, context, arg)
-    elif action == "moveto":
-        task_id, cat = arg.split(":")
-        await move_task(update, context, int(task_id), int(cat))
-    elif action == "dtab":
-        await show_tab_picker(update, context, "d")
-    elif action == "dtabset":
-        d = context.user_data.get("draft")
-        if not d:
-            await show_menu(update, context)
-            return
-        cat = int(arg)
-        d["category_id"] = cat if cat and db.get_category(cat, update.effective_user.id) else None
-        await show_draft(update, context)
-    elif action == "done_list":
-        await show_done_list(update, context)
-    elif action == "task":
-        await show_task(update, context, int(arg))
-    elif action == "undone":
-        db.set_active(int(arg), update.effective_user.id)
-        await show_task(update, context, int(arg))
-    elif action == "resched":
-        await ask_reschedule(update, context, int(arg))
-    elif action == "shift":
-        task_id, how = arg.split(":")
-        await shift_task(update, context, int(task_id), how)
-    elif action == "edit":
-        await ask_edit(update, context, int(arg))
-    elif action == "del":
-        await ask_delete(update, context, int(arg))
-    elif action == "delyes":
-        db.delete_task(int(arg), update.effective_user.id)
-        await reply_or_edit(update, header("Задача удалена"),
-                            kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
-    elif action == "draft_save":
-        await save_draft(update, context)
-    elif action == "draft_when":
-        if "draft" not in context.user_data:
-            await show_menu(update, context)
-            return
-        context.user_data["state"] = WAIT_DRAFT_WHEN
-        await reply_or_edit(
-            update,
-            header("Дата и время") + "\n\nНапишите дату и время, например:\n"
-            "<code>завтра в 18:00</code>, <code>6 ноября</code>, <code>12.11 в 9:30</code>",
-            kb([[("Сегодня", "draft_day:0"), ("Завтра", "draft_day:1")],
-                [("Без срока", "draft_day:none")],
-                [("←  Назад", "draft_back")]]),
-        )
-    elif action == "skip":
-        await skip_task(update, context, int(arg))
-    elif action == "repmenu":
-        await show_repeat_menu(update, context, arg)
-    elif action == "repset":
-        target, kind = arg.split(":")
-        await set_repeat_choice(update, context, target, kind)
-    elif action == "draft_day":
-        d = context.user_data.get("draft")
-        if not d:
-            await show_menu(update, context)
-            return
-        if arg == "none":
-            d["due_date"], d["due_time"], d["repeat"] = None, None, None
-        else:
-            d["due_date"] = now().date() + timedelta(days=int(arg))
-            refresh_draft_repeat(d)
-        context.user_data["state"] = None
-        await show_draft(update, context)
-    elif action == "draft_back":
-        if "draft" in context.user_data:
-            context.user_data["state"] = None
-            await show_draft(update, context)
-        else:
-            await show_menu(update, context)
-
-
-def refresh_draft_repeat(draft: dict):
-    """После смены даты пересчитываем правило повтора (например, "каждую среду" -> "каждую пятницу")."""
-    if draft.get("repeat") and draft["due_date"]:
-        draft["repeat"] = make_repeat(draft["repeat"].partition(":")[0], draft["due_date"])
+    handler = BUTTONS.get(action)
+    if handler:
+        await handler(update, context, arg)
 
 
 # ---------- Обработка текстовых сообщений ----------
@@ -1234,15 +1220,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == WAIT_RESCHEDULE:
         task_id = context.user_data["task_id"]
-        task = db.get_task(task_id, uid)
+        task = await load_task(update, context, task_id)
+        if not task:
+            return
         d_new, t_new = parse_when(text, n)
-        if not task or (not d_new and not t_new):
+        if not d_new and not t_new:
             await update.message.reply_text(
                 "Не удалось распознать дату. Пример: «завтра в 18:00», «12.11» или «в 16:30».")
             return
-        d = d_new or (date.fromisoformat(task["due_date"]) if task["due_date"] else n.date())
-        t = t_new or (time.fromisoformat(task["due_time"]) if task["due_time"] else None)
-        db.update_when(task_id, uid, d, t, n)
+        db.update_when(task_id, uid, d_new or task_date(task) or n.date(), t_new or task_time(task), n)
         context.user_data.clear()
         task = db.get_task(task_id, uid)
         await update.message.reply_text(header("Задача перенесена") + "\n\n" + card_from_row(task),
@@ -1251,23 +1237,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if state == WAIT_EDIT_TEXT:
         task_id = context.user_data["task_id"]
-        task = db.get_task(task_id, uid)
+        task = await load_task(update, context, task_id)
         if not task:
-            await show_menu(update, context)
             return
         p = parse_task(text, n)
-        db.update_text(task_id, uid, p["title"], p["place"], p["person"])
-        # parse_when не подставляет "сегодня", если указано только время, — дата останется прежней
-        d_new, t_new = parse_when(text, n)
-        if d_new or t_new:
-            d = d_new or (date.fromisoformat(task["due_date"]) if task["due_date"] else n.date())
-            t = t_new or (time.fromisoformat(task["due_time"]) if task["due_time"] else None)
-            db.update_when(task_id, uid, d, t, n)
+        db.update_task(task_id, uid, title=p["title"], place=p["place"], person=p["person"])
         if p["repeat"]:
             # В новом тексте есть "каждый день", "по пятницам" и т.п. — обновляем повтор вместе с датой
-            db.update_when(task_id, uid, p["due_date"], p["due_time"] or (
-                time.fromisoformat(task["due_time"]) if task["due_time"] else None), n)
-            db.set_repeat(task_id, uid, p["repeat"])
+            db.update_when(task_id, uid, p["due_date"], p["due_time"] or task_time(task), n)
+            db.update_task(task_id, uid, repeat=p["repeat"])
+        else:
+            # parse_when не подставляет "сегодня", если указано только время, — дата останется прежней
+            d_new, t_new = parse_when(text, n)
+            if d_new or t_new:
+                db.update_when(task_id, uid, d_new or task_date(task) or n.date(), t_new or task_time(task), n)
         context.user_data.clear()
         task = db.get_task(task_id, uid)
         await update.message.reply_text(header("Задача изменена") + "\n\n" + card_from_row(task),
@@ -1288,12 +1271,11 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Запускается каждую минуту и отправляет напоминания, время которых наступило."""
     n = now()
     for task, num in db.due_reminders(n):
-        if task["due_time"]:
-            start = datetime.fromisoformat(f"{task['due_date']} {task['due_time']}")
-            # Если бот был выключен и напоминание сильно опоздало — не шлём устаревшее
-            if start < n.replace(tzinfo=None):
-                db.mark_reminded(task["id"], num)
-                continue
+        # Если бот был выключен и задача уже прошла (для задачи без времени — её день закончился),
+        # устаревшее напоминание не шлём
+        if datetime.combine(task_date(task), task_time(task) or time.max) < n.replace(tzinfo=None):
+            db.mark_reminded(task["id"], num)
+            continue
         head = header("Напоминание") if num == 1 else header("Напоминание", "Скоро начало")
         if num == 2 and not task["due_time"]:
             head = header("Напоминание", "Задача на сегодня")
@@ -1324,7 +1306,7 @@ async def check_reports(context: ContextTypes.DEFAULT_TYPE):
     for kind in ("week", "month"):
         if not is_report_day(kind, n.date()):
             continue
-        for user in db.users_for_report(kind, n.strftime("%H:%M"), today):
+        for user in db.users_due(f"report_{kind}", n.strftime("%H:%M"), today):
             try:
                 await send_report(context.bot, user["user_id"], kind)
             except Exception as exc:
@@ -1336,7 +1318,7 @@ async def check_weather(context: ContextTypes.DEFAULT_TYPE):
     """Запускается каждую минуту и отправляет ежедневный прогноз тем, у кого наступило время."""
     n = now()
     today = n.date().isoformat()
-    for user in db.users_for_weather(n.strftime("%H:%M"), today):
+    for user in db.users_due("weather", n.strftime("%H:%M"), today, "AND city_lat IS NOT NULL"):
         try:
             text = await weather.today_text(user["city_name"], user["city_lat"], user["city_lon"])
         except weather.WeatherError as exc:
@@ -1378,9 +1360,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(set_commands).build()
 
     app.add_handler(CommandHandler(["start", "menu"], start))
-    app.add_handler(CommandHandler("summary", summary_command))
-    app.add_handler(CommandHandler("weather", weather_command))
-    app.add_handler(CommandHandler("month", month_command))
+    app.add_handler(CommandHandler("summary", command(lambda u, c: report_now(u, c, "week"))))
+    app.add_handler(CommandHandler("month", command(lambda u, c: report_now(u, c, "month"))))
+    app.add_handler(CommandHandler("weather", command(send_weather_now)))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
