@@ -91,27 +91,36 @@ def is_overdue(task) -> bool:
     return date.fromisoformat(task["due_date"]) < n.date()
 
 
+def header(title: str, subtitle: str = "") -> str:
+    """Заголовок сообщения: жирные заглавные буквы и, при желании, подзаголовок курсивом."""
+    text = f"<b>{title.upper()}</b>"
+    return text + f"\n<i>{subtitle}</i>" if subtitle else text
+
+
 def task_card(title, place, person, due_date, due_time, extra="") -> str:
-    """Красивое описание задачи для сообщения."""
+    """Описание задачи: название и детали в блоке-цитате (с серой полосой слева)."""
     e = html.escape
-    lines = [f"📌 <b>{e(title)}</b>", f"📅 Дата: {fmt_date(due_date)}"]
+    when = fmt_date(due_date)
     if due_time:
-        lines.append(f"🕐 Время: {fmt_time(due_time)}")
+        when += f" · {fmt_time(due_time)}"
+    details = [f"Когда — {when}"]
     if place:
-        lines.append(f"📍 Место: {e(place)}")
+        details.append(f"Где — {e(place)}")
     if person:
-        lines.append(f"👤 {e(person)}")
-    if extra:
-        lines.append(extra)
-    return "\n".join(lines)
+        # "с Иваном Петровым" -> "С кем — Иваном Петровым"
+        name = person.split(" ", 1)[1] if person.lower().startswith(("с ", "со ")) else person
+        details.append(f"С кем — {e(name)}")
+    text = f"<b>{e(title)}</b>\n<blockquote>" + "\n".join(details) + "</blockquote>"
+    return text + "\n" + extra if extra else text
 
 
 def card_from_row(task) -> str:
     extra = ""
     if task["status"] == "done":
-        extra = f"✅ Выполнено: {task['completed_at']}"
+        done_at = datetime.strptime(task["completed_at"], "%Y-%m-%d %H:%M")
+        extra = f"<i>Выполнено {done_at.strftime('%d.%m.%Y в %H:%M')}</i>"
     elif is_overdue(task):
-        extra = "⚠️ <b>Срок прошёл!</b>"
+        extra = "<b>Срок истёк.</b>"
     return task_card(task["title"], task["place"], task["person"],
                      task["due_date"], task["due_time"], extra)
 
@@ -120,14 +129,14 @@ def short_label(task) -> str:
     """Короткая подпись задачи для кнопки в списке."""
     parts = []
     if is_overdue(task):
-        parts.append("⚠️")
+        parts.append("!")
     if task["due_date"]:
         d = date.fromisoformat(task["due_date"])
         parts.append(d.strftime("%d.%m"))
     if task["due_time"]:
         parts.append(task["due_time"])
     label = " ".join(parts)
-    label = f"{label} · {task['title']}" if label else task["title"]
+    label = f"{label} — {task['title']}" if label else task["title"]
     return label if len(label) <= 60 else label[:57] + "…"
 
 
@@ -140,20 +149,19 @@ def kb(rows) -> InlineKeyboardMarkup:
 
 
 MAIN_MENU = kb([
-    [("➕ Создать новую задачу", "new")],
-    [("📋 Текущие задачи", "list:all")],
-    [("✅ Выполненные задачи", "done_list")],
-    [("⚙️ Настройки", "settings")],
+    [("+  Новая задача", "new")],
+    [("≡  Текущие задачи", "list:all")],
+    [("✓  Выполненные", "done_list"), ("⋯  Настройки", "settings")],
 ])
 
-BACK_TO_MENU = kb([[("🏠 Главное меню", "menu")]])
+BACK_TO_MENU = kb([[("⌂  Главное меню", "menu")]])
 
 
 def draft_keyboard():
     return kb([
-        [("💾 Сохранить", "draft_save")],
-        [("📅 Изменить дату/время", "draft_when"), ("✏️ Заново", "new")],
-        [("❌ Отмена", "menu")],
+        [("✓  Сохранить", "draft_save")],
+        [("Дата и время", "draft_when"), ("✎  Заново", "new")],
+        [("✕  Отмена", "menu")],
     ])
 
 
@@ -161,15 +169,15 @@ def task_keyboard(task):
     tid = task["id"]
     if task["status"] == "done":
         return kb([
-            [("↩️ Вернуть в текущие", f"undone:{tid}")],
-            [("🗑 Удалить", f"del:{tid}")],
-            [("⬅️ К выполненным", "done_list"), ("🏠 Меню", "menu")],
+            [("↺  Вернуть в текущие", f"undone:{tid}")],
+            [("✕  Удалить", f"del:{tid}")],
+            [("←  Выполненные", "done_list"), ("⌂  Меню", "menu")],
         ])
     return kb([
-        [("✅ Отметить выполненной", f"done:{tid}")],
-        [("📅 Перенести", f"resched:{tid}"), ("✏️ Изменить", f"edit:{tid}")],
-        [("🗑 Удалить", f"del:{tid}")],
-        [("⬅️ К списку", "list:all"), ("🏠 Меню", "menu")],
+        [("✓  Выполнено", f"done:{tid}")],
+        [("→  Перенести", f"resched:{tid}"), ("✎  Изменить", f"edit:{tid}")],
+        [("✕  Удалить", f"del:{tid}")],
+        [("←  К списку", "list:all"), ("⌂  Меню", "menu")],
     ])
 
 
@@ -181,11 +189,10 @@ def allowed(update: Update) -> bool:
 
 
 def greeting(update: Update) -> str:
-    name = html.escape(update.effective_user.first_name or "друг")
-    return (f"👋 Здравствуйте, <b>{name}</b>!\n\n"
-            "Я ваш планировщик задач. Выберите действие:\n\n"
-            "<i>Подсказка: можно просто написать мне задачу, например:\n"
-            "«6 числа встреча по адресу ул. Ленина 5 с Иваном в 15:00»</i>")
+    name = html.escape(update.effective_user.first_name or "")
+    return (f"<b>Здравствуйте, {name}.</b>\n\n"
+            "Планировщик задач. Выберите раздел или просто напишите задачу сообщением.\n\n"
+            "<blockquote>6 числа встреча по адресу ул. Ленина 5 с Иваном в 15:00</blockquote>")
 
 
 async def reply_or_edit(update: Update, text: str, markup=None):
@@ -214,7 +221,7 @@ async def answer_query(update: Update, text: str = None):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
-        await update.message.reply_text("Извините, это личный бот 🙂")
+        await update.message.reply_text("Доступ к этому боту ограничен.")
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     context.user_data.clear()
@@ -232,28 +239,27 @@ async def ask_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["state"] = WAIT_NEW_TASK
     text = (
-        "✍️ <b>Напишите задачу одним сообщением.</b>\n\n"
-        "Можно указать дату, время, место и человека — я сам всё разберу.\n\n"
-        "Примеры:\n"
-        "• <code>6 числа встреча по адресу ул. Ленина 5 с Иваном Петровым в 15:00</code>\n"
-        "• <code>Завтра в 10 утра позвонить маме</code>\n"
-        "• <code>15.11 сдать отчёт</code>\n"
-        "• <code>В пятницу в 19:00 ужин со Светланой</code>\n"
-        "• <code>Купить продукты</code> (без срока)"
+        header("Новая задача") + "\n\n"
+        "Опишите задачу одним сообщением. Дату, время, место и человека бот распознает сам.\n\n"
+        "<blockquote>6 числа встреча по адресу ул. Ленина 5 с Иваном Петровым в 15:00\n"
+        "Завтра в 10 утра позвонить маме\n"
+        "15.11 сдать отчёт\n"
+        "В пятницу в 19:00 ужин со Светланой\n"
+        "Купить продукты</blockquote>"
     )
-    await reply_or_edit(update, text, kb([[("❌ Отмена", "menu")]]))
+    await reply_or_edit(update, text, kb([[("✕  Отмена", "menu")]]))
 
 
 async def show_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data["draft"]
     extra = ""
     if d["due_date"] and d["due_date"] < now().date():
-        extra = "⚠️ Эта дата уже прошла — если это ошибка, нажмите «Изменить дату/время»."
+        extra = "<i>Эта дата уже прошла. Если это ошибка — нажмите «Дата и время».</i>"
     elif not d["due_date"]:
-        extra = "ℹ️ Дата не указана — задача будет без срока и без напоминаний."
-    text = "🔎 <b>Вот что я понял:</b>\n\n" + task_card(
+        extra = "<i>Без срока — напоминаний не будет.</i>"
+    text = header("Проверьте задачу") + "\n\n" + task_card(
         d["title"], d["place"], d["person"], d["due_date"], d["due_time"], extra
-    ) + "\n\nВсё верно?"
+    )
     await reply_or_edit(update, text, draft_keyboard())
 
 
@@ -267,12 +273,12 @@ async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     note = ""
     if d["due_date"]:
-        note = "\n\n🔔 Я напомню о ней за день и за пару часов до начала."
+        note = "\n<i>Напоминания — за сутки и за два часа.</i>"
     await reply_or_edit(
         update,
-        "✅ <b>Задача сохранена!</b>\n\n"
+        header("Задача сохранена") + "\n\n"
         + task_card(d["title"], d["place"], d["person"], d["due_date"], d["due_time"]) + note,
-        kb([[("➕ Ещё задача", "new"), ("📋 Текущие", "list:all")], [("🏠 Главное меню", "menu")]]),
+        kb([[("+  Ещё задача", "new"), ("≡  Текущие", "list:all")], [("⌂  Главное меню", "menu")]]),
     )
 
 
@@ -305,31 +311,31 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, period: 
     context.user_data.clear()
     tasks = filter_tasks(db.get_active_tasks(update.effective_user.id), period)
 
-    filter_row = [((("• " + name + " •") if key == period else name), f"list:{key}")
+    filter_row = [((("● " + name) if key == period else name), f"list:{key}")
                   for key, name in FILTERS.items()]
     rows = [filter_row]
     rows += [[(short_label(t), f"task:{t['id']}")] for t in tasks[:40]]
-    rows.append([("➕ Новая задача", "new"), ("🏠 Меню", "menu")])
+    rows.append([("+  Новая задача", "new"), ("⌂  Меню", "menu")])
 
+    text = header("Текущие задачи", f"{FILTERS[period]} · {len(tasks)}") + "\n\n"
     if tasks:
-        text = (f"📋 <b>Текущие задачи</b> ({FILTERS[period].lower()}): {len(tasks)}\n\n"
-                "Нажмите на задачу, чтобы отметить её выполненной, перенести или изменить.")
+        text += "Выберите задачу, чтобы отметить, перенести или изменить её."
         if len(tasks) > 40:
-            text += "\n\nПоказаны первые 40."
+            text += "\nПоказаны первые 40."
     else:
-        text = f"📋 <b>Текущие задачи</b> ({FILTERS[period].lower()})\n\nЗадач нет 🎉"
+        text += "Задач нет."
     await reply_or_edit(update, text, kb(rows))
 
 
 async def show_done_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     tasks = db.get_done_tasks(update.effective_user.id)
-    rows = [[("✅ " + short_label(t), f"task:{t['id']}")] for t in tasks]
-    rows.append([("🏠 Главное меню", "menu")])
+    rows = [[("✓ " + short_label(t), f"task:{t['id']}")] for t in tasks]
+    rows.append([("⌂  Главное меню", "menu")])
     if tasks:
-        text = f"✅ <b>Выполненные задачи</b> (последние {len(tasks)})\n\nНажмите на задачу, чтобы открыть её."
+        text = header("Выполненные задачи", f"Показано: {len(tasks)}") + "\n\nВыберите задачу, чтобы открыть её."
     else:
-        text = "✅ <b>Выполненные задачи</b>\n\nПока ничего не выполнено. Всё впереди! 💪"
+        text = header("Выполненные задачи") + "\n\nПока пусто."
     await reply_or_edit(update, text, kb(rows))
 
 
@@ -352,14 +358,13 @@ async def ask_reschedule(update: Update, context: ContextTypes.DEFAULT_TYPE, tas
     context.user_data.clear()
     context.user_data["state"] = WAIT_RESCHEDULE
     context.user_data["task_id"] = task_id
-    text = (card_from_row(task) + "\n\n📅 <b>На когда перенести?</b>\n\n"
-            "Нажмите кнопку или напишите новую дату и/или время, например:\n"
-            "<code>завтра в 18:00</code>, <code>12.11</code>, <code>в 16:30</code>, "
-            "<code>в понедельник</code>")
+    text = (header("Перенос задачи") + "\n\n" + card_from_row(task) + "\n\n"
+            "Выберите вариант или напишите новую дату и время: "
+            "<code>завтра в 18:00</code>, <code>12.11</code>, <code>в 16:30</code>.")
     await reply_or_edit(update, text, kb([
         [("+1 час", f"shift:{task_id}:h1"), ("+1 день", f"shift:{task_id}:d1")],
         [("+1 неделя", f"shift:{task_id}:w1"), ("Без срока", f"shift:{task_id}:none")],
-        [("⬅️ Назад", f"task:{task_id}")],
+        [("←  Назад", f"task:{task_id}")],
     ]))
 
 
@@ -386,7 +391,7 @@ async def shift_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
     elif how == "w1":
         d += timedelta(weeks=1)
     db.update_when(task_id, uid, d, t, n)
-    await reply_or_edit(update, "📅 <b>Задача перенесена.</b>\n\n" + card_from_row(db.get_task(task_id, uid)),
+    await reply_or_edit(update, header("Задача перенесена") + "\n\n" + card_from_row(db.get_task(task_id, uid)),
                         task_keyboard(db.get_task(task_id, uid)))
 
 
@@ -398,24 +403,23 @@ async def ask_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: 
     context.user_data.clear()
     context.user_data["state"] = WAIT_EDIT_TEXT
     context.user_data["task_id"] = task_id
-    text = (card_from_row(task) + "\n\n✏️ <b>Напишите новый текст задачи.</b>\n\n"
-            "Можно указать и новое место, человека, дату и время — я их обновлю. "
-            "Если дату не укажете, она останется прежней.\n\n"
+    text = (header("Изменение задачи") + "\n\n" + card_from_row(task) + "\n\n"
+            "Отправьте новый текст задачи. Если в нём не будет даты, она останется прежней.\n\n"
             f"Текущий текст: <code>{html.escape(task['title'])}</code>")
     await reply_or_edit(update, text, kb([
-        [("📅 Изменить только дату/время", f"resched:{task_id}")],
-        [("⬅️ Назад", f"task:{task_id}")],
+        [("→  Изменить только дату и время", f"resched:{task_id}")],
+        [("←  Назад", f"task:{task_id}")],
     ]))
 
 
 async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
     uid = update.effective_user.id
     db.set_done(task_id, uid, now())
-    await answer_query(update, "Отлично! Задача выполнена ✅")
+    await answer_query(update, "Задача выполнена")
     task = db.get_task(task_id, uid)
     if task:
-        await reply_or_edit(update, "🎉 <b>Задача выполнена!</b>\n\n" + card_from_row(task),
-                            kb([[("📋 К текущим задачам", "list:all")], [("🏠 Главное меню", "menu")]]))
+        await reply_or_edit(update, header("Задача выполнена") + "\n\n" + card_from_row(task),
+                            kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
 
 
 async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
@@ -423,8 +427,8 @@ async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
     if not task:
         await show_menu(update, context)
         return
-    await reply_or_edit(update, card_from_row(task) + "\n\n🗑 <b>Точно удалить задачу?</b>",
-                        kb([[("Да, удалить", f"delyes:{task_id}"), ("Нет", f"task:{task_id}")]]))
+    await reply_or_edit(update, header("Удалить задачу?") + "\n\n" + card_from_row(task),
+                        kb([[("✕  Удалить", f"delyes:{task_id}"), ("←  Отмена", f"task:{task_id}")]]))
 
 
 # ---------- Настройки ----------
@@ -435,9 +439,9 @@ WEATHER_TIMES = ["06:00", "07:00", "07:30", "08:00", "09:00", "10:00"]
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     # Сюда будут добавляться новые разделы настроек
-    await reply_or_edit(update, "⚙️ <b>Настройки</b>\n\nВыберите раздел:", kb([
-        [("🌤 Погода", "w_settings")],
-        [("🏠 Главное меню", "menu")],
+    await reply_or_edit(update, header("Настройки") + "\n\nВыберите раздел.", kb([
+        [("Погода", "w_settings")],
+        [("⌂  Главное меню", "menu")],
     ]))
 
 
@@ -448,29 +452,32 @@ async def show_weather_settings(update: Update, context: ContextTypes.DEFAULT_TY
     w_time = (user["weather_time"] if user else None) or "08:00"
     enabled = bool(user and user["weather_enabled"])
 
-    lines = ["🌤 <b>Настройки погоды</b>", ""]
+    lines = [header("Погода", "Настройки"), ""]
     if note:
         lines += [note, ""]
-    lines.append(f"🏙 Город: <b>{html.escape(city)}</b>" if city else "🏙 Город: не выбран")
-    lines.append(f"🕐 Время прогноза: <b>{w_time}</b>")
-    lines.append("🔔 Ежедневный прогноз: <b>включён</b>" if enabled else "🔕 Ежедневный прогноз: выключен")
+    status = "включён" if enabled else "выключен"
+    lines.append("<blockquote>"
+                 f"Город — {html.escape(city) if city else 'не выбран'}\n"
+                 f"Время — {w_time}\n"
+                 f"Ежедневный прогноз — {status}"
+                 "</blockquote>")
     if not city:
-        lines += ["", "Чтобы получать прогноз, сначала укажите свой город."]
+        lines.append("Чтобы получать прогноз, укажите город.")
 
-    rows = [[("🏙 Изменить город" if city else "🏙 Указать город", "w_city")]]
+    rows = [[("Изменить город" if city else "Указать город", "w_city")]]
     if city:
-        rows.append([("🕐 Время прогноза", "w_time"),
-                     ("🔕 Выключить" if enabled else "🔔 Включить", "w_toggle")])
-        rows.append([("👀 Погода сейчас", "w_now")])
-    rows.append([("⬅️ Настройки", "settings"), ("🏠 Меню", "menu")])
+        rows.append([("Время прогноза", "w_time"),
+                     ("○  Выключить" if enabled else "●  Включить", "w_toggle")])
+        rows.append([("Погода сейчас", "w_now")])
+    rows.append([("←  Настройки", "settings"), ("⌂  Меню", "menu")])
     await reply_or_edit(update, "\n".join(lines), kb(rows))
 
 
 async def ask_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     context.user_data["state"] = WAIT_CITY
-    await reply_or_edit(update, "🏙 <b>Напишите название вашего города.</b>\n\nНапример: <code>Москва</code>",
-                        kb([[("⬅️ Назад", "w_settings")]]))
+    await reply_or_edit(update, header("Город") + "\n\nНапишите название города, например <code>Москва</code>.",
+                        kb([[("←  Назад", "w_settings")]]))
 
 
 def mark_weather_sent_if_time_passed(user_id: int, w_time: str):
@@ -487,13 +494,13 @@ async def save_city(update: Update, context: ContextTypes.DEFAULT_TYPE, city: di
     user = db.get_user(uid)
     first_time = not user["city_name"]
     db.update_user(uid, city_name=city["name"], city_lat=city["lat"], city_lon=city["lon"])
-    note = f"✅ Город сохранён: <b>{html.escape(city['label'])}</b>"
+    note = f"<i>Город сохранён: {html.escape(city['label'])}.</i>"
     if first_time:
         # При первом выборе города сразу включаем ежедневный прогноз
         w_time = user["weather_time"] or "08:00"
         db.update_user(uid, weather_enabled=1, weather_time=w_time)
         mark_weather_sent_if_time_passed(uid, w_time)
-        note += f"\nПрогноз будет приходить каждый день в {w_time}. Время можно поменять ниже."
+        note = note[:-4] + f"\nПрогноз будет приходить ежедневно в {w_time}.</i>"
     await show_weather_settings(update, context, note)
 
 
@@ -503,9 +510,9 @@ async def ask_weather_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = [(t, f"w_settime:{t}") for t in WEATHER_TIMES]
     await reply_or_edit(
         update,
-        "🕐 <b>Во сколько присылать прогноз?</b>\n\n"
-        "Нажмите кнопку или напишите своё время, например <code>6:45</code>.",
-        kb([buttons[:3], buttons[3:], [("⬅️ Назад", "w_settings")]]),
+        header("Время прогноза") + "\n\n"
+        "Выберите время или напишите своё, например <code>6:45</code>.",
+        kb([buttons[:3], buttons[3:], [("←  Назад", "w_settings")]]),
     )
 
 
@@ -513,7 +520,7 @@ async def set_weather_time(update: Update, context: ContextTypes.DEFAULT_TYPE, w
     uid = update.effective_user.id
     db.update_user(uid, weather_time=w_time, weather_enabled=1)
     mark_weather_sent_if_time_passed(uid, w_time)
-    await show_weather_settings(update, context, f"✅ Прогноз будет приходить каждый день в {w_time}.")
+    await show_weather_settings(update, context, f"<i>Прогноз будет приходить ежедневно в {w_time}.</i>")
 
 
 async def toggle_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,11 +528,11 @@ async def toggle_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(uid)
     if user["weather_enabled"]:
         db.update_user(uid, weather_enabled=0)
-        note = "🔕 Ежедневный прогноз выключен."
+        note = "<i>Ежедневный прогноз выключен.</i>"
     else:
         db.update_user(uid, weather_enabled=1)
         mark_weather_sent_if_time_passed(uid, user["weather_time"] or "08:00")
-        note = "🔔 Ежедневный прогноз включён."
+        note = "<i>Ежедневный прогноз включён.</i>"
     await show_weather_settings(update, context, note)
 
 
@@ -538,7 +545,7 @@ async def send_weather_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await weather.today_text(user["city_name"], user["city_lat"], user["city_lon"])
     except weather.WeatherError as exc:
         log.warning("Погода недоступна: %s", exc)
-        text = "😔 Не удалось получить прогноз. Попробуйте чуть позже."
+        text = "Не удалось получить прогноз. Попробуйте позже."
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=BACK_TO_MENU)
 
 
@@ -555,7 +562,7 @@ async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not allowed(update):
-        await answer_query(update, "Это личный бот 🙂")
+        await answer_query(update, "Доступ ограничен")
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     data = query.data
@@ -610,8 +617,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_delete(update, context, int(arg))
     elif action == "delyes":
         db.delete_task(int(arg), update.effective_user.id)
-        await reply_or_edit(update, "🗑 Задача удалена.",
-                            kb([[("📋 К текущим задачам", "list:all")], [("🏠 Главное меню", "menu")]]))
+        await reply_or_edit(update, header("Задача удалена"),
+                            kb([[("≡  Текущие задачи", "list:all")], [("⌂  Главное меню", "menu")]]))
     elif action == "draft_save":
         await save_draft(update, context)
     elif action == "draft_when":
@@ -621,11 +628,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["state"] = WAIT_DRAFT_WHEN
         await reply_or_edit(
             update,
-            "📅 Напишите дату и/или время, например:\n"
+            header("Дата и время") + "\n\nНапишите дату и время, например:\n"
             "<code>завтра в 18:00</code>, <code>6 ноября</code>, <code>12.11 в 9:30</code>",
             kb([[("Сегодня", "draft_day:0"), ("Завтра", "draft_day:1")],
                 [("Без срока", "draft_day:none")],
-                [("⬅️ Назад", "draft_back")]]),
+                [("←  Назад", "draft_back")]]),
         )
     elif action == "draft_day":
         d = context.user_data.get("draft")
@@ -650,7 +657,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
-        await update.message.reply_text("Извините, это личный бот 🙂")
+        await update.message.reply_text("Доступ к этому боту ограничен.")
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     text = update.message.text.strip()
@@ -663,11 +670,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cities = await weather.find_cities(text)
         except weather.WeatherError as exc:
             log.warning("Поиск города не удался: %s", exc)
-            await update.message.reply_text("😔 Сервис погоды сейчас недоступен. Попробуйте чуть позже.")
+            await update.message.reply_text("Сервис погоды сейчас недоступен. Попробуйте позже.")
             return
         if not cities:
             await update.message.reply_text(
-                "🤔 Не нашёл такой город. Проверьте написание и отправьте ещё раз.")
+                "Город не найден. Проверьте написание и отправьте ещё раз.")
             return
         if len(cities) == 1:
             await save_city(update, context, cities[0])
@@ -675,15 +682,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Несколько городов с таким названием — даём выбрать
         context.user_data["cities"] = cities
         rows = [[(c["label"][:60], f"w_citypick:{i}")] for i, c in enumerate(cities)]
-        rows.append([("⬅️ Назад", "w_settings")])
-        await update.message.reply_text("Какой из городов ваш?", reply_markup=kb(rows))
+        rows.append([("←  Назад", "w_settings")])
+        await update.message.reply_text("Уточните город:", reply_markup=kb(rows))
         return
 
     if state == WAIT_WEATHER_TIME:
         try:
             t = time.fromisoformat(text.replace(".", ":").zfill(5))
         except ValueError:
-            await update.message.reply_text("🤔 Не понял время. Напишите, например, 7:30 или 08:00.")
+            await update.message.reply_text("Не удалось распознать время. Пример: 7:30 или 08:00.")
             return
         await set_weather_time(update, context, t.strftime("%H:%M"))
         return
@@ -692,7 +699,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d_new, t_new = parse_when(text, n)
         if not d_new and not t_new:
             await update.message.reply_text(
-                "🤔 Не смог распознать дату. Попробуйте так: «завтра в 18:00» или «12.11».")
+                "Не удалось распознать дату. Пример: «завтра в 18:00» или «12.11».")
             return
         draft = context.user_data["draft"]
         if d_new:
@@ -711,14 +718,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d_new, t_new = parse_when(text, n)
         if not task or (not d_new and not t_new):
             await update.message.reply_text(
-                "🤔 Не смог распознать дату. Попробуйте так: «завтра в 18:00», «12.11» или «в 16:30».")
+                "Не удалось распознать дату. Пример: «завтра в 18:00», «12.11» или «в 16:30».")
             return
         d = d_new or (date.fromisoformat(task["due_date"]) if task["due_date"] else n.date())
         t = t_new or (time.fromisoformat(task["due_time"]) if task["due_time"] else None)
         db.update_when(task_id, uid, d, t, n)
         context.user_data.clear()
         task = db.get_task(task_id, uid)
-        await update.message.reply_text("📅 <b>Задача перенесена.</b>\n\n" + card_from_row(task),
+        await update.message.reply_text(header("Задача перенесена") + "\n\n" + card_from_row(task),
                                         reply_markup=task_keyboard(task), parse_mode=ParseMode.HTML)
         return
 
@@ -738,7 +745,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.update_when(task_id, uid, d, t, n)
         context.user_data.clear()
         task = db.get_task(task_id, uid)
-        await update.message.reply_text("✏️ <b>Задача изменена.</b>\n\n" + card_from_row(task),
+        await update.message.reply_text(header("Задача изменена") + "\n\n" + card_from_row(task),
                                         reply_markup=task_keyboard(task), parse_mode=ParseMode.HTML)
         return
 
@@ -760,14 +767,14 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             if start < n.replace(tzinfo=None):
                 db.mark_reminded(task["id"], num)
                 continue
-        head = "🔔 <b>Напоминание о задаче</b>" if num == 1 else "⏰ <b>Скоро начало!</b>"
+        head = header("Напоминание") if num == 1 else header("Напоминание", "Скоро начало")
         if num == 2 and not task["due_time"]:
-            head = "📌 <b>Напоминание: задача на сегодня</b>"
+            head = header("Напоминание", "Задача на сегодня")
         try:
             await context.bot.send_message(
                 task["user_id"], head + "\n\n" + card_from_row(task),
-                reply_markup=kb([[("✅ Выполнено", f"done:{task['id']}"),
-                                  ("📅 Перенести", f"resched:{task['id']}")]]),
+                reply_markup=kb([[("✓  Выполнено", f"done:{task['id']}"),
+                                  ("→  Перенести", f"resched:{task['id']}")]]),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as exc:
@@ -785,33 +792,27 @@ def build_summary(user_id: int, today: date) -> str:
 
     period = f"{week_start.strftime('%d.%m')} – {week_end.strftime('%d.%m')}"
     if not planned and not extra_done:
-        return f"📊 <b>Сводка за неделю {period}</b>\n\nНа этой неделе задач не было."
+        return header("Итоги недели", period) + "\n\nНа этой неделе задач не было."
 
-    lines = [f"📊 <b>Сводка за неделю {period}</b>", ""]
+    lines = [header("Итоги недели", period), ""]
     if planned:
         pct_done = round(len(done) * 100 / len(planned))
-        bar = "🟩" * round(pct_done / 10) + "⬜" * (10 - round(pct_done / 10))
-        lines += [
-            f"Запланировано задач: <b>{len(planned)}</b>",
-            f"✅ Выполнено: <b>{len(done)}</b> ({pct_done}%)",
-            f"❌ Не выполнено: <b>{len(not_done)}</b> ({100 - pct_done}%)",
-            "",
-            bar,
-        ]
-        if pct_done == 100:
-            lines.append("\n🏆 Великолепно! Все задачи выполнены!")
-        elif pct_done >= 70:
-            lines.append("\n💪 Отличный результат!")
-        elif pct_done >= 40:
-            lines.append("\n👍 Неплохо, но есть куда расти.")
-        else:
-            lines.append("\n🙂 Неделя была непростой. Следующая будет лучше!")
+        filled = round(pct_done / 10)
+        # Моноширинный блок: столбцы ровные, полоса — из чёрно-белых квадратов
+        lines.append(
+            "<pre>"
+            f"{'■' * filled}{'□' * (10 - filled)}  {pct_done}%\n\n"
+            f"{'Запланировано':<15}{len(planned):>4}\n"
+            f"{'Выполнено':<15}{len(done):>4}\n"
+            f"{'Не выполнено':<15}{len(not_done):>4}"
+            "</pre>"
+        )
     if extra_done:
-        lines.append(f"\nДополнительно выполнено задач без срока: <b>{len(extra_done)}</b>")
+        lines.append(f"Также выполнено задач без срока: {len(extra_done)}")
     if not_done:
-        lines.append("\n<b>Не выполнены:</b>")
-        for t in not_done[:15]:
-            lines.append(f"• {html.escape(short_label(t))}")
+        lines.append("\n<b>Не выполнены</b>")
+        lines.append("<blockquote>" + "\n".join(html.escape(short_label(t)) for t in not_done[:15])
+                     + "</blockquote>")
     return "\n".join(lines)
 
 
@@ -822,7 +823,7 @@ async def weekly_summary(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 user["user_id"], build_summary(user["user_id"], today),
-                reply_markup=kb([[("📋 Текущие задачи", "list:all")]]),
+                reply_markup=kb([[("≡  Текущие задачи", "list:all")]]),
                 parse_mode=ParseMode.HTML,
             )
         except Exception as exc:
