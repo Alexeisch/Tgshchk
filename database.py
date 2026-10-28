@@ -59,6 +59,16 @@ def init_db():
         # база обновилась автоматически и задачи не пропали.
         _add_missing_columns(conn, "users", USER_SETTINGS_COLUMNS)
         _add_missing_columns(conn, "tasks", TASK_EXTRA_COLUMNS)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS categories (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                name       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 # Настройки пользователя (хранятся в таблице users)
@@ -81,7 +91,8 @@ USER_SETTINGS_COLUMNS = {
 
 # Поля задач, добавленные в новых версиях бота
 TASK_EXTRA_COLUMNS = {
-    "repeat": "TEXT",   # правило повтора ("daily", "weekly:2", ...) или пусто
+    "repeat": "TEXT",          # правило повтора ("daily", "weekly:2", ...) или пусто
+    "category_id": "INTEGER",  # вкладка (таблица categories) или пусто — общая задача
 }
 
 
@@ -186,17 +197,18 @@ def _t(value):
     return value.strftime("%H:%M") if isinstance(value, time) else value
 
 
-def add_task(user_id, title, place, person, due_date, due_time, now: datetime, repeat=None) -> int:
+def add_task(user_id, title, place, person, due_date, due_time, now: datetime, repeat=None,
+             category_id=None) -> int:
     r1, s1, r2, s2 = calc_reminders(due_date, due_time, now)
     with connect() as conn:
         cur = conn.execute(
             """
             INSERT INTO tasks (user_id, title, place, person, due_date, due_time, created_at,
-                               remind1_at, remind1_sent, remind2_at, remind2_sent, repeat)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               remind1_at, remind1_sent, remind2_at, remind2_sent, repeat, category_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, title, place, person, _d(due_date), _t(due_time), _fmt(now),
-             r1, s1, r2, s2, repeat),
+             r1, s1, r2, s2, repeat, category_id),
         )
         return cur.lastrowid
 
@@ -213,16 +225,87 @@ def get_task(task_id: int, user_id: int):
         ).fetchone()
 
 
-def get_active_tasks(user_id: int):
-    """Все невыполненные задачи: сначала с датой (по порядку), потом без даты."""
+def get_active_tasks(user_id: int, category_id: int = None):
+    """
+    Невыполненные задачи: сначала с датой (по порядку), потом без даты.
+    category_id=None — все задачи, иначе только задачи этой вкладки.
+    """
+    where = "" if category_id is None else "AND category_id = ?"
+    params = (user_id,) if category_id is None else (user_id, category_id)
     with connect() as conn:
         return conn.execute(
-            """
-            SELECT * FROM tasks WHERE user_id = ? AND status = 'active'
+            f"""
+            SELECT * FROM tasks WHERE user_id = ? AND status = 'active' {where}
             ORDER BY due_date IS NULL, due_date, due_time IS NULL, due_time, id
             """,
-            (user_id,),
+            params,
         ).fetchall()
+
+
+def set_category(task_id: int, user_id: int, category_id):
+    with connect() as conn:
+        conn.execute("UPDATE tasks SET category_id = ? WHERE id = ? AND user_id = ?",
+                     (category_id, task_id, user_id))
+
+
+# ---------- Вкладки ----------
+
+def get_categories(user_id: int):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM categories WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+
+
+def get_category(category_id: int, user_id: int):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM categories WHERE id = ? AND user_id = ?", (category_id, user_id)
+        ).fetchone()
+
+
+def find_category(user_id: int, name: str):
+    """Вкладка с таким названием (без учёта регистра) или None."""
+    for c in get_categories(user_id):
+        if c["name"].lower() == name.lower():
+            return c
+    return None
+
+
+def add_category(user_id: int, name: str, now: datetime) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO categories (user_id, name, created_at) VALUES (?, ?, ?)",
+            (user_id, name, _fmt(now)),
+        )
+        return cur.lastrowid
+
+
+def rename_category(category_id: int, user_id: int, name: str):
+    with connect() as conn:
+        conn.execute("UPDATE categories SET name = ? WHERE id = ? AND user_id = ?",
+                     (name, category_id, user_id))
+
+
+def delete_category(category_id: int, user_id: int, with_tasks: bool):
+    """Удаляет вкладку. Её задачи удаляются или становятся общими (with_tasks=False)."""
+    with connect() as conn:
+        if with_tasks:
+            conn.execute("DELETE FROM tasks WHERE category_id = ? AND user_id = ?", (category_id, user_id))
+        else:
+            conn.execute("UPDATE tasks SET category_id = NULL WHERE category_id = ? AND user_id = ?",
+                         (category_id, user_id))
+        conn.execute("DELETE FROM categories WHERE id = ? AND user_id = ?", (category_id, user_id))
+
+
+def count_active_by_category(user_id: int) -> dict:
+    """{id вкладки: число текущих задач}; ключ None — общие задачи."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT category_id, COUNT(*) AS n FROM tasks WHERE user_id = ? AND status = 'active' "
+            "GROUP BY category_id", (user_id,),
+        ).fetchall()
+    return {r["category_id"]: r["n"] for r in rows}
 
 
 def get_done_tasks(user_id: int, limit: int = 30):

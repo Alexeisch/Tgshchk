@@ -55,6 +55,8 @@ WAIT_EDIT_TEXT = "wait_edit_text"
 WAIT_CITY = "wait_city"
 WAIT_WEATHER_TIME = "wait_weather_time"
 WAIT_REPORT_TIME = "wait_report_time"
+WAIT_TAB_NAME = "wait_tab_name"
+WAIT_TAB_RENAME = "wait_tab_rename"
 
 
 def now() -> datetime:
@@ -101,7 +103,7 @@ def header(title: str, subtitle: str = "") -> str:
     return text + f"\n<i>{subtitle}</i>" if subtitle else text
 
 
-def task_card(title, place, person, due_date, due_time, extra="", repeat=None) -> str:
+def task_card(title, place, person, due_date, due_time, extra="", repeat=None, tab=None) -> str:
     """Описание задачи: название и детали в блоке-цитате (с серой полосой слева)."""
     e = html.escape
     when = fmt_date(due_date)
@@ -116,6 +118,8 @@ def task_card(title, place, person, due_date, due_time, extra="", repeat=None) -
         details.append(f"С кем — {e(name)}")
     if repeat:
         details.append(f"Повтор — {repeat_label(repeat)}")
+    if tab:
+        details.append(f"Вкладка — {e(tab)}")
     text = f"<b>{e(title)}</b>\n<blockquote>" + "\n".join(details) + "</blockquote>"
     return text + "\n" + extra if extra else text
 
@@ -128,11 +132,20 @@ def card_from_row(task) -> str:
     elif is_overdue(task):
         extra = "<b>Срок истёк.</b>"
     return task_card(task["title"], task["place"], task["person"],
-                     task["due_date"], task["due_time"], extra, task["repeat"])
+                     task["due_date"], task["due_time"], extra, task["repeat"],
+                     tab_name(task["category_id"], task["user_id"]))
 
 
-def short_label(task) -> str:
-    """Короткая подпись задачи для кнопки в списке."""
+def tab_name(category_id, user_id: int):
+    """Название вкладки по её номеру (или None для общих задач)."""
+    if not category_id:
+        return None
+    c = db.get_category(category_id, user_id)
+    return c["name"] if c else None
+
+
+def short_label(task, tab: str = None) -> str:
+    """Короткая подпись задачи для кнопки в списке (tab — название вкладки, если нужно показать)."""
     parts = []
     if is_overdue(task):
         parts.append("!")
@@ -145,6 +158,8 @@ def short_label(task) -> str:
         parts.append("↻")
     label = " ".join(parts)
     label = f"{label} — {task['title']}" if label else task["title"]
+    if tab:
+        label += f" · {tab}"
     return label if len(label) <= 60 else label[:57] + "…"
 
 
@@ -156,11 +171,21 @@ def kb(rows) -> InlineKeyboardMarkup:
     )
 
 
-MAIN_MENU = kb([
-    [("+  Новая задача", "new")],
-    [("≡  Текущие задачи", "list:all")],
-    [("✓  Выполненные", "done_list"), ("⋯  Настройки", "settings")],
-])
+def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    """Главное меню: «Все задачи», под ними вкладки пользователя."""
+    counts = db.count_active_by_category(user_id)
+    total = sum(counts.values())
+    rows = [
+        [("+  Новая задача", "new")],
+        [(f"≡  Все задачи · {total}" if total else "≡  Все задачи", "list:all:0")],
+    ]
+    tabs = [(f"▸  {c['name']} · {counts[c['id']]}" if counts.get(c["id"]) else f"▸  {c['name']}",
+             f"list:all:{c['id']}") for c in db.get_categories(user_id)]
+    rows += [tabs[i:i + 2] for i in range(0, len(tabs), 2)]  # по две вкладки в ряд
+    rows.append([("▤  Новая вкладка", "tabnew")])
+    rows.append([("✓  Выполненные", "done_list"), ("⋯  Настройки", "settings")])
+    return kb(rows)
+
 
 BACK_TO_MENU = kb([[("⌂  Главное меню", "menu")]])
 
@@ -169,7 +194,7 @@ def draft_keyboard():
     return kb([
         [("✓  Сохранить", "draft_save")],
         [("Дата и время", "draft_when"), ("↻  Повтор", "repmenu:d")],
-        [("✎  Заново", "new")],
+        [("▤  Вкладка", "dtab"), ("✎  Заново", "new")],
         [("✕  Отмена", "menu")],
     ])
 
@@ -187,8 +212,9 @@ def task_keyboard(task):
         rows.append([("»  Пропустить этот раз", f"skip:{tid}")])
     rows += [
         [("→  Перенести", f"resched:{tid}"), ("✎  Изменить", f"edit:{tid}")],
-        [("↻  Повтор", f"repmenu:{tid}"), ("✕  Удалить", f"del:{tid}")],
-        [("←  К списку", "list:all"), ("⌂  Меню", "menu")],
+        [("↻  Повтор", f"repmenu:{tid}"), ("▤  Вкладка", f"move:{tid}")],
+        [("✕  Удалить", f"del:{tid}")],
+        [("←  К списку", "list:back"), ("⌂  Меню", "menu")],
     ]
     return kb(rows)
 
@@ -237,21 +263,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.save_user(update.effective_user.id, update.effective_user.first_name or "")
     context.user_data.clear()
-    await reply_or_edit(update, greeting(update), MAIN_MENU)
+    await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await reply_or_edit(update, greeting(update), MAIN_MENU)
+    await reply_or_edit(update, greeting(update), main_menu(update.effective_user.id))
 
 
 # ---------- Создание задачи ----------
 
-async def ask_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE, category_id: int = None):
     context.user_data.clear()
     context.user_data["state"] = WAIT_NEW_TASK
+    context.user_data["new_cat"] = category_id  # задача сразу попадёт в эту вкладку
+    tab = tab_name(category_id, update.effective_user.id)
     text = (
-        header("Новая задача") + "\n\n"
+        header("Новая задача", f"Вкладка «{html.escape(tab)}»" if tab else "") + "\n\n"
         "Опишите задачу одним сообщением. Дату, время, место и человека бот распознает сам.\n\n"
         "<blockquote>6 числа встреча по адресу ул. Ленина 5 с Иваном Петровым в 15:00\n"
         "Завтра в 10 утра позвонить маме\n"
@@ -270,7 +298,8 @@ async def show_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif not d["due_date"]:
         extra = "<i>Без срока — напоминаний не будет.</i>"
     text = header("Проверьте задачу") + "\n\n" + task_card(
-        d["title"], d["place"], d["person"], d["due_date"], d["due_time"], extra, d.get("repeat")
+        d["title"], d["place"], d["person"], d["due_date"], d["due_time"], extra, d.get("repeat"),
+        tab_name(d.get("category_id"), update.effective_user.id)
     )
     await reply_or_edit(update, text, draft_keyboard())
 
@@ -281,7 +310,7 @@ async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, context)
         return
     db.add_task(update.effective_user.id, d["title"], d["place"], d["person"],
-                d["due_date"], d["due_time"], now(), d.get("repeat"))
+                d["due_date"], d["due_time"], now(), d.get("repeat"), d.get("category_id"))
     context.user_data.clear()
     note = ""
     if d["due_date"]:
@@ -290,8 +319,11 @@ async def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         header("Задача сохранена") + "\n\n"
         + task_card(d["title"], d["place"], d["person"], d["due_date"], d["due_time"],
-                    repeat=d.get("repeat")) + note,
-        kb([[("+  Ещё задача", "new"), ("≡  Текущие", "list:all")], [("⌂  Главное меню", "menu")]]),
+                    repeat=d.get("repeat"), tab=tab_name(d.get("category_id"), update.effective_user.id))
+        + note,
+        kb([[("+  Ещё задача", f"newin:{d.get('category_id') or 0}"),
+             ("≡  К списку", f"list:all:{d.get('category_id') or 0}")],
+            [("⌂  Главное меню", "menu")]]),
     )
 
 
@@ -320,23 +352,41 @@ def filter_tasks(tasks, period: str):
     return result
 
 
-async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str = "all"):
+async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str = "all", cat: int = 0):
+    """Список текущих задач. cat = 0 — все задачи, иначе номер вкладки."""
+    uid = update.effective_user.id
+    tab = db.get_category(cat, uid) if cat else None
+    if cat and not tab:
+        cat = 0  # вкладку удалили — показываем все задачи
     context.user_data.clear()
-    tasks = filter_tasks(db.get_active_tasks(update.effective_user.id), period)
+    # Если пользователь, находясь во вкладке, просто напишет задачу — она попадёт сюда
+    context.user_data["new_cat"] = cat or None
+    # Запоминаем, какой список открыт, чтобы кнопка «К списку» вела обратно сюда
+    context.chat_data["last_list"] = (period, cat)
 
-    filter_row = [((("● " + name) if key == period else name), f"list:{key}")
+    tasks = filter_tasks(db.get_active_tasks(uid, cat or None), period)
+    names = {} if cat else {c["id"]: c["name"] for c in db.get_categories(uid)}
+
+    filter_row = [((("● " + name) if key == period else name), f"list:{key}:{cat}")
                   for key, name in FILTERS.items()]
     rows = [filter_row]
-    rows += [[(short_label(t), f"task:{t['id']}")] for t in tasks[:40]]
-    rows.append([("+  Новая задача", "new"), ("⌂  Меню", "menu")])
+    rows += [[(short_label(t, names.get(t["category_id"])), f"task:{t['id']}")] for t in tasks[:40]]
+    if cat:
+        rows.append([("+  Задача во вкладку", f"newin:{cat}"), ("⋯  Вкладка", f"tabopt:{cat}")])
+        rows.append([("≡  Все задачи", "list:all:0"), ("⌂  Меню", "menu")])
+    else:
+        rows.append([("+  Новая задача", "new"), ("⌂  Меню", "menu")])
 
-    text = header("Текущие задачи", f"{FILTERS[period]} · {len(tasks)}") + "\n\n"
+    title = tab["name"] if cat else "Все задачи"
+    text = header(title, f"{FILTERS[period]} · {len(tasks)}") + "\n\n"
     if tasks:
         text += "Выберите задачу, чтобы отметить, перенести или изменить её."
         if len(tasks) > 40:
             text += "\nПоказаны первые 40."
     else:
         text += "Задач нет."
+    if cat:
+        text += "\n<i>Новую задачу можно просто написать сообщением — она попадёт в эту вкладку.</i>"
     await reply_or_edit(update, text, kb(rows))
 
 
@@ -439,7 +489,8 @@ async def mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
         # Повторяющаяся задача: создаём следующий раз, а у выполненной копии повтор убираем
         nxt = next_run(task, n)
         due_time = time.fromisoformat(task["due_time"]) if task["due_time"] else None
-        db.add_task(uid, task["title"], task["place"], task["person"], nxt, due_time, n, task["repeat"])
+        db.add_task(uid, task["title"], task["place"], task["person"], nxt, due_time, n, task["repeat"],
+                    task["category_id"])
         db.set_repeat(task_id, uid, None)
         when = fmt_date(nxt) + (f" · {task['due_time']}" if task["due_time"] else "")
         note = f"\n<i>Следующий раз — {when}</i>"
@@ -552,6 +603,113 @@ async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id
     note = "\n<i>Повтор тоже будет остановлен.</i>" if task["repeat"] else ""
     await reply_or_edit(update, header("Удалить задачу?") + "\n\n" + card_from_row(task) + note,
                         kb([[("✕  Удалить", f"delyes:{task_id}"), ("←  Отмена", f"task:{task_id}")]]))
+
+
+# ---------- Вкладки ----------
+
+async def ask_tab_name(update: Update, context: ContextTypes.DEFAULT_TYPE, rename_id: int = None):
+    context.user_data.clear()
+    if rename_id:
+        context.user_data["state"] = WAIT_TAB_RENAME
+        context.user_data["tab_id"] = rename_id
+        title, back = "Переименовать вкладку", f"tabopt:{rename_id}"
+    else:
+        context.user_data["state"] = WAIT_TAB_NAME
+        title, back = "Новая вкладка", "menu"
+    await reply_or_edit(update, header(title) + "\n\nНапишите название, например <code>Учёба</code> "
+                        "или <code>Работа</code>.", kb([[("←  Назад", back)]]))
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Склонение по числу: 1 задача, 2 задачи, 5 задач."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def clean_tab_name(text: str):
+    name = " ".join(text.split())[:30]
+    return name or None
+
+
+async def show_tab_options(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int):
+    context.user_data.clear()
+    uid = update.effective_user.id
+    tab = db.get_category(cat, uid)
+    if not tab:
+        await show_menu(update, context)
+        return
+    n = db.count_active_by_category(uid).get(cat, 0)
+    await reply_or_edit(update, header(tab["name"], "Вкладка") + f"\n\nТекущих задач: {n}", kb([
+        [("✎  Переименовать", f"tabren:{cat}"), ("✕  Удалить", f"tabdel:{cat}")],
+        [("←  Назад", f"list:all:{cat}")],
+    ]))
+
+
+async def ask_tab_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int):
+    uid = update.effective_user.id
+    tab = db.get_category(cat, uid)
+    if not tab:
+        await show_menu(update, context)
+        return
+    n = db.count_active_by_category(uid).get(cat, 0)
+    rows = []
+    if n:
+        rows.append([("Удалить, задачи сделать общими", f"tabdelyes:{cat}:keep")])
+        rows.append([("Удалить вместе с задачами", f"tabdelyes:{cat}:all")])
+    else:
+        rows.append([("✕  Удалить", f"tabdelyes:{cat}:keep")])
+    rows.append([("←  Отмена", f"tabopt:{cat}")])
+    text = header("Удалить вкладку?", tab["name"]) + "\n\n"
+    text += (f"Во вкладке {n} {plural(n, 'текущая задача', 'текущие задачи', 'текущих задач')}. "
+             "Их можно оставить — они появятся в «Все задачи» "
+             "без вкладки, — или удалить вместе с вкладкой." if n else "Текущих задач во вкладке нет.")
+    await reply_or_edit(update, text, kb(rows))
+
+
+async def delete_tab(update: Update, context: ContextTypes.DEFAULT_TYPE, cat: int, mode: str):
+    db.delete_category(cat, update.effective_user.id, with_tasks=(mode == "all"))
+    await reply_or_edit(update, header("Вкладка удалена"), main_menu(update.effective_user.id))
+
+
+async def show_tab_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str):
+    """Выбор вкладки для задачи. target = "d" (создаваемая задача) или номер задачи."""
+    uid = update.effective_user.id
+    if target == "d":
+        d = context.user_data.get("draft")
+        if not d:
+            await show_menu(update, context)
+            return
+        current, back, prefix = d.get("category_id"), "draft_back", "dtabset:"
+        context.user_data["state"] = None
+    else:
+        task = db.get_task(int(target), uid)
+        if not task:
+            await show_menu(update, context)
+            return
+        current, back, prefix = task["category_id"], f"task:{target}", f"moveto:{target}:"
+    tabs = db.get_categories(uid)
+    rows = [[(("● " if current == c["id"] else "") + c["name"], f"{prefix}{c['id']}")] for c in tabs]
+    rows.append([(("● " if not current else "") + "Без вкладки", f"{prefix}0")])
+    rows.append([("←  Назад", back)])
+    text = header("Вкладка") + "\n\nВыберите, в какую вкладку положить задачу."
+    if not tabs:
+        text += "\n\n<i>Вкладок пока нет — создайте их в главном меню кнопкой «Новая вкладка».</i>"
+    await reply_or_edit(update, text, kb(rows))
+
+
+async def move_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int, cat: int):
+    uid = update.effective_user.id
+    if cat and not db.get_category(cat, uid):
+        cat = 0
+    db.set_category(task_id, uid, cat or None)
+    task = db.get_task(task_id, uid)
+    if not task:
+        await show_menu(update, context)
+        return
+    await reply_or_edit(update, header("Вкладка изменена") + "\n\n" + card_from_row(task), task_keyboard(task))
 
 
 # ---------- Настройки ----------
@@ -843,8 +1001,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await report_now(update, context, arg)
     elif action == "new":
         await ask_new_task(update, context)
+    elif action == "newin":
+        await ask_new_task(update, context, int(arg) or None)
     elif action == "list":
-        await show_list(update, context, arg or "all")
+        if arg == "back":
+            period, cat = context.chat_data.get("last_list", ("all", 0))
+        else:
+            period, _, cat = arg.partition(":")
+            period, cat = period or "all", int(cat or 0)
+        await show_list(update, context, period, cat)
+    elif action == "tabnew":
+        await ask_tab_name(update, context)
+    elif action == "tabopt":
+        await show_tab_options(update, context, int(arg))
+    elif action == "tabren":
+        await ask_tab_name(update, context, rename_id=int(arg))
+    elif action == "tabdel":
+        await ask_tab_delete(update, context, int(arg))
+    elif action == "tabdelyes":
+        cat, mode = arg.split(":")
+        await delete_tab(update, context, int(cat), mode)
+    elif action == "move":
+        await show_tab_picker(update, context, arg)
+    elif action == "moveto":
+        task_id, cat = arg.split(":")
+        await move_task(update, context, int(task_id), int(cat))
+    elif action == "dtab":
+        await show_tab_picker(update, context, "d")
+    elif action == "dtabset":
+        d = context.user_data.get("draft")
+        if not d:
+            await show_menu(update, context)
+            return
+        cat = int(arg)
+        d["category_id"] = cat if cat and db.get_category(cat, update.effective_user.id) else None
+        await show_draft(update, context)
     elif action == "done_list":
         await show_done_list(update, context)
     elif action == "task":
@@ -946,6 +1137,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Уточните город:", reply_markup=kb(rows))
         return
 
+    if state in (WAIT_TAB_NAME, WAIT_TAB_RENAME):
+        name = clean_tab_name(text)
+        if not name:
+            return
+        existing = db.find_category(uid, name)
+        if state == WAIT_TAB_RENAME:
+            cat = context.user_data["tab_id"]
+            if existing and existing["id"] != cat:
+                await update.message.reply_text("Вкладка с таким названием уже есть. Напишите другое.")
+                return
+            db.rename_category(cat, uid, name)
+        elif existing:
+            cat = existing["id"]  # такая вкладка уже есть — просто открываем её
+        else:
+            cat = db.add_category(uid, name, n)
+        await show_list(update, context, "all", cat)
+        return
+
     if state in (WAIT_WEATHER_TIME, WAIT_REPORT_TIME):
         hhmm = parse_hhmm(text)
         if not hhmm:
@@ -1018,8 +1227,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Во всех остальных случаях считаем сообщение новой задачей
+    category_id = context.user_data.get("new_cat")  # открыта вкладка — задача попадёт в неё
     context.user_data.clear()
     context.user_data["draft"] = parse_task(text, n)
+    context.user_data["draft"]["category_id"] = category_id
     await show_draft(update, context)
 
 
